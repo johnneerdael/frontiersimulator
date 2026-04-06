@@ -47,9 +47,11 @@ Small chunks (4MB) → many requests → new TCP+TLS per request (server closes)
 | Requests per connection | **Unlimited** (observed 235 on single conn) | trace: `connections: 1` across all worker configs |
 | TLS handshake cost | One-time ~60ms at connection start | Only 1 connection opened per worker |
 | Connection rate limit | Not observed | Zero retries, zero failures in any configuration |
-| Max throughput (24MB chunks, 3 workers) | **784 Mbps**, zero stalls | 1 connection, 235 requests, stability 0.0 |
-| Max throughput (24MB chunks, 2 workers) | **784 Mbps**, zero stalls | Same — throughput limited by network, not transport |
-| Max throughput (24MB chunks, 1 worker) | **771 Mbps**, zero stalls | Even 1 worker saturates the link |
+| Optimal config | **16MB chunks × 3 workers** | Highest throughput + safe budget with zero stalls |
+| Max throughput | **856 Mbps** (16MB × 3w) | 384 requests, 1 connection, 13,779 frontier events |
+| Max safe budget | **762 Mbps** (16MB × 3w) | Requires sufficient frontier event resolution |
+| Why not 24-32MB? | Safe budget underestimated at 425 Mbps | Fewer frontier events = coarser binary search resolution |
+| Why not 4 workers? | 2.1s stall with 4 workers | Single TCP connection can't feed 4 parallel readers |
 | HTTP version | HTTP/1.1 | CDN: energycdn.com |
 
 **Root cause chain:**
@@ -94,18 +96,24 @@ val REALDEBRID_POLICY = TransportPolicy(
 val PREMIUMIZE_POLICY = TransportPolicy(
     maxSafeUrgentWorkers = 3,
     maxSafePrefetchWorkers = 1,
-    // Chunk size matters less (keep-alive), but larger = fewer events
-    maxSafeUrgentChunkBytes = 8L * 1024 * 1024,    // 8 MB
-    maxSafePrefetchChunkBytes = 16L * 1024 * 1024,  // 16 MB
+    // 16 MB is the sweet spot: enough frontier granularity for accurate
+    // safe budget measurement, small enough for fast frontier advancement
+    maxSafeUrgentChunkBytes = 16L * 1024 * 1024,   // 16 MB
+    maxSafePrefetchChunkBytes = 32L * 1024 * 1024,  // 32 MB
     maxNewConnectionsPerSecond = 0, // No limit needed
     expectKeepAlive = true,
 )
 ```
 
-**Why 8MB for urgent on Premiumize:**
-- Connection reuse means no TLS overhead per request
-- Smaller chunks = faster frontier advancement = smoother playback
-- 3 workers × 8MB at 780 Mbps = ~30+ frontier events/sec — excellent granularity
+**Why 16MB for urgent on Premiumize:**
+- Connection reuse means zero TLS overhead per request (single keep-alive connection)
+- 16MB chunks produce ~13,000+ frontier events in 60s — enough resolution for the
+  safe budget binary search to find the true ceiling (762 Mbps vs 425 Mbps with 24MB chunks)
+- 3 workers × 16MB at 856 Mbps = 384 requests in 60s, zero stalls, 0.0 stability penalty
+- 4 workers introduces occasional stalls (2.1s) — the single TCP connection can't feed
+  4 parallel readers without gaps. 3 workers is the sweet spot.
+- Larger chunks (24-32MB) reduce frontier event count, causing the binary search to
+  underestimate safe budget by ~40% (coarser simulation resolution)
 
 ---
 
@@ -363,9 +371,19 @@ val supportsKeepAlive = connectionHeader?.lowercase() != "close"
 
 | Chunk Size | Workers | Duration | Requests | Connections | Retries | Stalls | Max Stall | Throughput | Safe Budget | Stability |
 |-----------|---------|----------|----------|-------------|---------|--------|-----------|------------|-------------|-----------|
-| 24 MB | 4 | 60s | 227 | 1 | 0 | 1 | 2.3s | 713 Mbps | 425 Mbps | 0.4 |
-| 24 MB | 3 | 60s | 235 | 1 | 0 | 0 | 0.8s | 784 Mbps | 425 Mbps | 0.0 |
-| 24 MB | 2 | 60s | 231 | 1 | 0 | 0 | 0.2s | 771 Mbps | 425 Mbps | 0.0 |
+| **16 MB** | **3** | **60s** | **384** | **1** | **0** | **0** | **0.3s** | **856 Mbps** | **762 Mbps** | **0.0** |
+| 16 MB | 4 | 60s | 388 | 1 | 0 | 1 | 2.1s | 856 Mbps | 756 Mbps | 0.4 |
+| 16 MB | 2 | 60s | 376 | 1 | 0 | 0 | 0.2s | 838 Mbps | 752 Mbps | 0.0 |
+| 24 MB | 1 | 60s | 231 | 1 | 0 | 0 | 0.2s | 771 Mbps | 425 Mbps | 0.0 |
+| 24 MB | 2 | 60s | 235 | 1 | 0 | 0 | 0.8s | 784 Mbps | 425 Mbps | 0.0 |
+| 24 MB | 3 | 60s | 227 | 1 | 0 | 1 | 2.3s | 713 Mbps | 425 Mbps | 0.4 |
+| 32 MB | 2 | 60s | 188 | 1 | 0 | 0 | 1.8s | 771 Mbps | 425 Mbps | 0.0 |
+| 32 MB | 3 | 60s | 181 | 1 | 0 | 0 | 1.2s | 719 Mbps | 425 Mbps | 0.0 |
+
+**Key insight:** With Premiumize's keep-alive connection, chunk size affects measurement accuracy
+more than transport performance. Smaller chunks produce more frontier events, giving the binary
+search simulation higher resolution. At 24-32MB the safe budget appears to cap at 425 Mbps, but
+at 16MB with the same throughput (~856 Mbps) the safe budget correctly measures 762 Mbps.
 
 ### 7.3 Wire-Level Evidence
 
