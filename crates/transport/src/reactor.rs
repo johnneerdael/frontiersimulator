@@ -31,7 +31,10 @@ mod libc_types {
 const STALL_THRESHOLD_MS: u64 = 2_000;
 
 /// Maximum retry attempts per chunk before giving up.
-const MAX_ATTEMPTS: u32 = 3;
+const MAX_ATTEMPTS: u32 = 10;
+
+/// Base backoff delay for retries (doubles each attempt).
+const RETRY_BACKOFF_BASE_MS: u64 = 2_000;
 
 /// Token to identify an easy handle within the multi handle.
 type Token = usize;
@@ -81,6 +84,8 @@ struct PrioritizedChunk {
     range_end: u64,
     lane: Lane,
     attempt: u32,
+    /// Earliest time this chunk can be retried (backoff).
+    retry_after: Option<Instant>,
 }
 
 impl PartialEq for PrioritizedChunk {
@@ -281,6 +286,7 @@ pub fn run_parallel(
             range_end: chunk.range_end,
             lane: chunk.lane,
             attempt: 0,
+            retry_after: None,
         });
     }
 
@@ -313,6 +319,8 @@ pub fn run_parallel(
         }
 
         // Fill slots with queued chunks (unless time expired)
+        // Chunks with retry_after in the future are deferred back to the queue.
+        let mut deferred: Vec<PrioritizedChunk> = Vec::new();
         while !time_expired && active_handles.len() < max_concurrent {
             let chunk = match chunk_queue.pop() {
                 Some(c) => c,
@@ -322,6 +330,14 @@ pub fn run_parallel(
             // Skip already-completed chunks (from retries that raced)
             if completed_chunks.contains(&chunk.chunk_id) {
                 continue;
+            }
+
+            // Respect retry backoff — defer if not ready yet
+            if let Some(retry_at) = chunk.retry_after {
+                if Instant::now() < retry_at {
+                    deferred.push(chunk);
+                    continue;
+                }
             }
 
             let request_id = next_request_id;
@@ -383,10 +399,23 @@ pub fn run_parallel(
             handle.set_token(token).map_err(|e| format!("set token: {e}"))?;
             active_handles.insert(token, (handle, state));
         }
+        // Put deferred (backoff) chunks back
+        for d in deferred {
+            chunk_queue.push(d);
+        }
 
         // Exit: no active handles and (queue empty or time expired)
-        if active_handles.is_empty() && (chunk_queue.is_empty() || time_expired) {
+        // Also consider deferred chunks — if only deferred chunks remain, keep looping
+        // so they can be picked up after their backoff expires.
+        let only_deferred_remain = chunk_queue.iter().all(|c| {
+            c.retry_after.map_or(false, |t| Instant::now() < t)
+        });
+        if active_handles.is_empty() && (time_expired || (chunk_queue.is_empty())) {
             break;
+        }
+        // If only deferred chunks and no active handles, sleep briefly to avoid busy-wait
+        if active_handles.is_empty() && only_deferred_remain && !chunk_queue.is_empty() {
+            std::thread::sleep(Duration::from_millis(200));
         }
 
         // Poll for activity (100ms timeout)
@@ -601,21 +630,32 @@ pub fn run_parallel(
                 conn.requests_count += 1;
                 conn.bytes_total += bytes;
 
-                // Fix 1 + Fix 4: Retry failed/incomplete chunks with frontier awareness
+                // Retry failed/incomplete chunks with frontier awareness + backoff
                 if is_complete {
                     completed_chunks.insert(state.chunk_id);
                 } else if !time_expired && state.attempt < MAX_ATTEMPTS {
-                    // Re-queue with remaining range
                     let suffix_start = state.range_start + bytes;
                     retried_chunks += 1;
 
-                    // Fix 4: Determine lane based on frontier position
-                    // If this chunk's start is at or near the frontier, make it urgent
-                    let retry_lane = if suffix_start <= current_frontier_byte + config.page_size * 2 {
-                        Lane::Urgent // This chunk is blocking or near the frontier
+                    // Promote to Urgent if this chunk is at or near the frontier
+                    // Use the chunk's original range_start for comparison (not suffix)
+                    // since a chunk starting at the frontier byte IS the blocker
+                    let chunk_start_byte = state.chunk_id * (state.range_end - state.range_start + 1);
+                    let is_frontier_blocker = chunk_start_byte <= current_frontier_byte + config.page_size;
+                    let retry_lane = if is_frontier_blocker {
+                        Lane::Urgent
                     } else {
                         state.lane
                     };
+
+                    // Exponential backoff: 2s, 4s, 8s, 16s...
+                    // Frontier-blocking chunks get shorter backoff (500ms, 1s, 2s...)
+                    let backoff_ms = if is_frontier_blocker {
+                        500 * (1u64 << state.attempt.min(4))
+                    } else {
+                        RETRY_BACKOFF_BASE_MS * (1u64 << state.attempt.min(4))
+                    };
+                    let retry_at = Instant::now() + Duration::from_millis(backoff_ms);
 
                     let _ = event_tx.send(TraceEvent::RequestResumed {
                         request_id: state.request_id,
@@ -630,6 +670,7 @@ pub fn run_parallel(
                         range_end: state.range_end,
                         lane: retry_lane,
                         attempt: state.attempt,
+                        retry_after: Some(retry_at),
                     });
                 } else if !is_complete {
                     failed_chunks += 1;
@@ -692,6 +733,7 @@ mod tests {
             range_end: 8 * 1024 * 1024 - 1,
             lane: Lane::Prefetch,
             attempt: 0,
+            retry_after: None,
         });
         queue.push(PrioritizedChunk {
             chunk_id: 0,
@@ -699,6 +741,7 @@ mod tests {
             range_end: 4 * 1024 * 1024 - 1,
             lane: Lane::Urgent,
             attempt: 0,
+            retry_after: None,
         });
         // Urgent should come out first
         let first = queue.pop().unwrap();
@@ -715,6 +758,7 @@ mod tests {
             range_end: 12 * 1024 * 1024 - 1,
             lane: Lane::Prefetch,
             attempt: 0,
+            retry_after: None,
         });
         queue.push(PrioritizedChunk {
             chunk_id: 1,
@@ -722,6 +766,7 @@ mod tests {
             range_end: 8 * 1024 * 1024 - 1,
             lane: Lane::Prefetch,
             attempt: 0,
+            retry_after: None,
         });
         let first = queue.pop().unwrap();
         assert_eq!(first.chunk_id, 1); // lower offset
