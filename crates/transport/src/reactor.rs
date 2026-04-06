@@ -14,6 +14,11 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+#[allow(non_camel_case_types)]
+mod libc_types {
+    pub type c_long = i64;
+}
+
 /// Stall threshold — no page progress for this duration triggers stall detection.
 /// Matches Kotlin's STALL_THRESHOLD_MS = 2000.
 const STALL_THRESHOLD_MS: u64 = 2_000;
@@ -419,9 +424,80 @@ pub fn run_parallel(
                     .to_string();
                 let mut hasher = Sha256::new();
                 hasher.update(eff_url.as_bytes());
-                let url_hash = format!("{:x}", hasher.finalize());
+                let _url_hash = format!("{:x}", hasher.finalize());
 
-                let error_class = curl_err.map(|_| ErrorClass::Other);
+                // Classify errors properly
+                let error_class = curl_err.as_ref().map(|e| {
+                    let desc = format!("{e}").to_lowercase();
+                    if desc.contains("timeout") || desc.contains("timed out") {
+                        ErrorClass::Timeout
+                    } else if desc.contains("reset") || desc.contains("connection") && desc.contains("refused") {
+                        ErrorClass::ConnectionReset
+                    } else if desc.contains("resolve") || desc.contains("dns") {
+                        ErrorClass::DnsFailure
+                    } else if desc.contains("ssl") || desc.contains("tls") || desc.contains("certificate") {
+                        ErrorClass::TlsFailure
+                    } else if desc.contains("recv") || desc.contains("eof") || desc.contains("closed") {
+                        ErrorClass::RecvError
+                    } else if bytes == 0 && handler.response_code.map_or(false, |c| c >= 400) {
+                        ErrorClass::HttpError
+                    } else {
+                        ErrorClass::Other
+                    }
+                });
+
+                // Also classify as error when curl succeeded but we got 0 bytes or HTTP error
+                let error_class = error_class.or_else(|| {
+                    if let Some(code) = handler.response_code {
+                        if code >= 400 {
+                            return Some(ErrorClass::HttpError);
+                        }
+                    }
+                    None
+                });
+
+                // Detect actual HTTP version from response status line
+                let http_version = handler.response_code
+                    .and_then(|_| {
+                        // Look for HTTP/2 or HTTP/1.1 in captured status line headers
+                        for (k, _) in &handler.headers {
+                            if k.contains("http/2") || k == "http/2" {
+                                return Some("h2".to_string());
+                            }
+                        }
+                        None
+                    })
+                    .unwrap_or_else(|| {
+                        // Use CURLINFO_HTTP_VERSION if available, fallback heuristic
+                        let raw_handle = easy.raw();
+                        let mut http_ver: libc_types::c_long = 0;
+                        // CURLINFO_HTTP_VERSION = CURLINFO_LONG + 46 = 0x200000 + 46
+                        let curlinfo_http_version = 0x200000 + 46;
+                        let got_version = unsafe {
+                            curl_sys::curl_easy_getinfo(
+                                raw_handle,
+                                curlinfo_http_version,
+                                &mut http_ver as *mut libc_types::c_long,
+                            ) == curl_sys::CURLE_OK
+                        };
+                        if got_version {
+                            match http_ver {
+                                2 => "h1.1".to_string(),
+                                3 => "h2".to_string(),
+                                4 => "h3".to_string(),
+                                _ => format!("http/{http_ver}"),
+                            }
+                        } else {
+                            "unknown".to_string()
+                        }
+                    });
+
+                // Determine protocol string for connection registry
+                let protocol_str = format!(
+                    "{}{}",
+                    if tls_ms > 0.0 { "https/" } else { "http/" },
+                    http_version
+                );
 
                 // Emit request_finished
                 let _ = event_tx.send(TraceEvent::RequestFinished {
@@ -433,7 +509,7 @@ pub fn run_parallel(
                     ttfb_ms,
                     queue_ms,
                     total_ms,
-                    http_version: url_hash.clone(), // placeholder
+                    http_version: http_version.clone(),
                     connection_id: conn_id,
                     new_connection,
                     error_class,
@@ -447,11 +523,7 @@ pub fn run_parallel(
                     new_connection,
                     local_endpoint: local_ep.clone(),
                     remote_endpoint: remote_ep.clone(),
-                    protocol: if tls_ms > 0.0 {
-                        "https".to_string()
-                    } else {
-                        "http".to_string()
-                    },
+                    protocol: protocol_str.clone(),
                     timestamp_ns: run_start.elapsed().as_nanos() as u64,
                 });
 
@@ -459,11 +531,7 @@ pub fn run_parallel(
                 let ts_ns = run_start.elapsed().as_nanos() as u64;
                 let conn = connections.entry(conn_id).or_insert_with(|| ConnectionRecord {
                     connection_id: conn_id,
-                    protocol: if tls_ms > 0.0 {
-                        "https".to_string()
-                    } else {
-                        "http".to_string()
-                    },
+                    protocol: protocol_str,
                     local_endpoint: local_ep,
                     remote_endpoint: remote_ep,
                     first_use_ns: ts_ns,

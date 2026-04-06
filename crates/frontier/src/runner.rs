@@ -20,6 +20,10 @@ pub struct FrontierRunResult {
     pub max_frontier_stall_ms: u64,
     pub max_sustainable_bitrate_mbps: f64,
     pub safe_budget_mbps: f64,
+    /// Wall-clock run duration in ms.
+    pub run_duration_ms: u64,
+    /// Time from last frontier advance to run end (the tail drain gap).
+    pub tail_drain_ms: u64,
 }
 
 /// Processes trace events from the reactor, tracking frontier advancement and
@@ -63,20 +67,50 @@ pub fn run_frontier_tracker(
         let _ = frontier_tx.send(event);
     }
 
-    // Compute metrics using the frontier event timeline for elapsed time.
-    // This gives accurate results even in tests where wall-clock is near zero.
-    let events = tracker.frontier_events();
-    let elapsed_ms = if events.len() >= 2 {
-        events.last().unwrap().t_ms - events.first().unwrap().t_ms
-    } else {
-        run_start.elapsed().as_millis() as u64
-    };
-    let elapsed_ms = elapsed_ms.max(1); // avoid division by zero
+    // Use wall-clock elapsed time for metrics computation.
+    // This is critical: the frontier may stop advancing long before the run ends,
+    // and the tail drain (time from last frontier advance to run end) must be
+    // accounted for in the budget simulation.
+    let wall_elapsed_ms = run_start.elapsed().as_millis() as u64;
+    let elapsed_ms = wall_elapsed_ms.max(1); // avoid division by zero
     let metrics = tracker.compute_metrics(elapsed_ms);
 
-    // Run shadow player simulation
+    // Build the event list for simulation, including a synthetic tail-drain event.
+    // The tail-drain event has zero delta bytes at the run end timestamp, which
+    // forces the simulator to drain the buffer for the entire no-progress tail.
+    // Without this, the simulator only sees events up to the last frontier advance
+    // and ignores the potentially long gap to run end — dramatically overstating
+    // the sustainable bitrate.
+    let mut sim_events: Vec<crate::tracker::FrontierEvent> = tracker.frontier_events().to_vec();
+    if let Some(last) = sim_events.last() {
+        let last_event_ms = last.t_ms;
+        if wall_elapsed_ms > last_event_ms + 100 {
+            // Add a zero-delta event at run end to force tail drain
+            sim_events.push(crate::tracker::FrontierEvent {
+                t_ms: wall_elapsed_ms,
+                contiguous_frontier_bytes: last.contiguous_frontier_bytes,
+                delta_contiguous_bytes: 0,
+            });
+        }
+    }
+
+    // Run shadow player simulation with tail-drain-aware events
     let estimator = SafeBudgetEstimator::new();
-    let sim_result = estimator.find_max_sustainable_bitrate(tracker.frontier_events());
+    let sim_result = estimator.find_max_sustainable_bitrate(&sim_events);
+
+    // Compute tail drain: gap between last frontier advance and run end
+    let tail_drain_ms = tracker.frontier_events()
+        .last()
+        .map(|last| wall_elapsed_ms.saturating_sub(last.t_ms))
+        .unwrap_or(wall_elapsed_ms);
+
+    // Stability penalty must include the tail drain gap (frontier freeze)
+    let effective_max_stall = metrics.max_frontier_stall_ms.max(tail_drain_ms);
+    let effective_stall_count = if tail_drain_ms > 2_000 {
+        metrics.frontier_stall_count + 1
+    } else {
+        metrics.frontier_stall_count
+    };
 
     // Build capability envelope
     let envelope = CapabilityEnvelope {
@@ -90,8 +124,8 @@ pub fn run_frontier_tracker(
         p10_throughput_mbps: None, // requires multiple runs
         seek_ttfb_p50_ms: None, // requires seek testing
         stability_penalty: compute_stability_penalty(
-            metrics.frontier_stall_count,
-            metrics.max_frontier_stall_ms,
+            effective_stall_count,
+            effective_max_stall,
         ),
         supports_range_requests: config.range_support,
         measured_at_ms: std::time::SystemTime::now()
@@ -105,10 +139,12 @@ pub fn run_frontier_tracker(
         frontier_events_count: metrics.total_frontier_events,
         final_frontier_bytes: metrics.final_frontier_bytes,
         frontier_advance_rate_mbps: metrics.frontier_advance_rate_mbps,
-        frontier_stall_count: metrics.frontier_stall_count,
-        max_frontier_stall_ms: metrics.max_frontier_stall_ms,
+        frontier_stall_count: effective_stall_count,
+        max_frontier_stall_ms: effective_max_stall,
         max_sustainable_bitrate_mbps: sim_result.max_sustainable_bitrate_mbps,
         safe_budget_mbps: sim_result.safe_budget_mbps,
+        run_duration_ms: wall_elapsed_ms,
+        tail_drain_ms,
     }
 }
 

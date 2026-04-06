@@ -375,6 +375,8 @@ fn main() {
                     "advance_rate_mbps": frontier_result.frontier_advance_rate_mbps,
                     "stall_count": frontier_result.frontier_stall_count,
                     "max_stall_ms": frontier_result.max_frontier_stall_ms,
+                    "tail_drain_ms": frontier_result.tail_drain_ms,
+                    "run_duration_ms": frontier_result.run_duration_ms,
                     "max_sustainable_bitrate_mbps": frontier_result.max_sustainable_bitrate_mbps,
                     "safe_budget_mbps": frontier_result.safe_budget_mbps,
                 },
@@ -400,11 +402,19 @@ fn main() {
                 );
                 println!("Requests: {} across {} connections", r.total_requests, r.total_connections);
             }
-            println!("Frontier: {:.1} MB contiguous, {} events, {} stalls",
+            println!("Frontier: {:.1} MB contiguous, {} events, {} stalls (max {:.1}s)",
                 frontier_result.final_frontier_bytes as f64 / 1_048_576.0,
                 frontier_result.frontier_events_count,
                 frontier_result.frontier_stall_count,
+                frontier_result.max_frontier_stall_ms as f64 / 1000.0,
             );
+            if frontier_result.tail_drain_ms > 2_000 {
+                println!("Tail drain: {:.1}s (frontier frozen from {:.1}s to {:.1}s)",
+                    frontier_result.tail_drain_ms as f64 / 1000.0,
+                    (frontier_result.run_duration_ms - frontier_result.tail_drain_ms) as f64 / 1000.0,
+                    frontier_result.run_duration_ms as f64 / 1000.0,
+                );
+            }
             if let Some(rate) = frontier_result.frontier_advance_rate_mbps {
                 println!("Frontier rate: {:.1} Mbps", rate);
             }
