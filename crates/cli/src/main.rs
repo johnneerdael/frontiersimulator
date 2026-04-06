@@ -55,6 +55,14 @@ enum Commands {
         #[arg(long, default_value = "0")]
         max_bytes: u64,
 
+        /// Chunk size in MB (default: from config, typically 4)
+        #[arg(long)]
+        chunk_size_mb: Option<u32>,
+
+        /// Number of urgent workers (default: from config)
+        #[arg(long)]
+        workers: Option<u32>,
+
         /// Output directory for trace files
         #[arg(short, long)]
         output: Option<String>,
@@ -210,9 +218,11 @@ fn main() {
             }
         }
 
-        Commands::Benchmark { target, duration, max_bytes, output } => {
+        Commands::Benchmark { target, duration, max_bytes, chunk_size_mb, workers, output } => {
             let page_size = (cfg.defaults.page_size_kb as u64) * 1024;
-            let chunk_size = (cfg.defaults.chunk_size_mb as u64) * 1024 * 1024;
+            let effective_chunk_mb = chunk_size_mb.unwrap_or(cfg.defaults.chunk_size_mb);
+            let chunk_size = (effective_chunk_mb as u64) * 1024 * 1024;
+            let effective_urgent_workers = workers.unwrap_or(cfg.defaults.urgent_workers);
             let trace_dir = output.unwrap_or_else(|| cfg.output.trace_dir.clone());
             let run_id = format!(
                 "run_{}",
@@ -279,11 +289,12 @@ fn main() {
             }
 
             println!(
-                "Benchmarking: {} chunks queued, {:.1} MB available, {}s duration, {} urgent + {} prefetch workers",
+                "Benchmarking: {} chunks queued ({} MB chunks), {:.1} MB available, {}s duration, {} urgent + {} prefetch workers",
                 chunks.len(),
+                effective_chunk_mb,
                 download_size as f64 / 1_048_576.0,
                 duration,
-                cfg.defaults.urgent_workers,
+                effective_urgent_workers,
                 cfg.defaults.prefetch_workers,
             );
 
@@ -306,9 +317,9 @@ fn main() {
                 run_id: run_id.clone(),
                 asset_key: asset_key.clone(),
                 config: serde_json::json!({
-                    "chunk_size_mb": cfg.defaults.chunk_size_mb,
+                    "chunk_size_mb": effective_chunk_mb,
                     "page_size_kb": cfg.defaults.page_size_kb,
-                    "urgent_workers": cfg.defaults.urgent_workers,
+                    "urgent_workers": effective_urgent_workers,
                     "prefetch_workers": cfg.defaults.prefetch_workers,
                     "sink": format!("{:?}", cfg.defaults.sink),
                 }),
@@ -319,7 +330,7 @@ fn main() {
             let frontier_config = FrontierRunConfig {
                 page_size,
                 chunk_size_bytes: chunk_size,
-                urgent_workers: cfg.defaults.urgent_workers,
+                urgent_workers: effective_urgent_workers,
                 prefetch_workers: cfg.defaults.prefetch_workers,
                 range_support: probe_result.range_support,
             };
@@ -333,7 +344,7 @@ fn main() {
 
             // Run reactor with frontier feedback
             let reactor_config = ReactorConfig {
-                urgent_workers: cfg.defaults.urgent_workers,
+                urgent_workers: effective_urgent_workers,
                 prefetch_workers: cfg.defaults.prefetch_workers,
                 page_size,
                 sink: cfg.defaults.sink,
@@ -436,9 +447,9 @@ fn main() {
                     .unwrap_or_default()
                     .as_millis() as i64;
                 let config_json = serde_json::json!({
-                    "chunk_size_mb": cfg.defaults.chunk_size_mb,
+                    "chunk_size_mb": effective_chunk_mb,
                     "page_size_kb": cfg.defaults.page_size_kb,
-                    "urgent_workers": cfg.defaults.urgent_workers,
+                    "urgent_workers": effective_urgent_workers,
                     "prefetch_workers": cfg.defaults.prefetch_workers,
                 }).to_string();
                 let _ = db::insert_run(&db_conn, &run_id, &asset_key, "", started_at_ms, &config_json);
