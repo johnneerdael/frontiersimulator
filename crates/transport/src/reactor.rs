@@ -29,6 +29,9 @@ pub struct ReactorConfig {
     pub sink: Sink,
     pub stall_timeout: Duration,
     pub request_timeout: Duration,
+    /// Maximum benchmark duration. Once elapsed, no new chunks are started.
+    /// In-flight requests complete normally. Zero means no limit.
+    pub max_duration: Duration,
 }
 
 impl Default for ReactorConfig {
@@ -40,6 +43,7 @@ impl Default for ReactorConfig {
             sink: Sink::Discard,
             stall_timeout: Duration::from_millis(STALL_THRESHOLD_MS),
             request_timeout: Duration::from_secs(120),
+            max_duration: Duration::from_secs(120),
         }
     }
 }
@@ -203,9 +207,14 @@ pub fn run_parallel(
     let mut total_bytes: u64 = 0;
     let mut total_requests: u32 = 0;
 
+    let has_duration_limit = config.max_duration > Duration::ZERO;
+
     loop {
-        // Fill slots with queued chunks
-        while active_handles.len() < max_concurrent {
+        // Check duration limit — stop queueing new chunks if time is up
+        let time_expired = has_duration_limit && run_start.elapsed() >= config.max_duration;
+
+        // Fill slots with queued chunks (unless time expired)
+        while !time_expired && active_handles.len() < max_concurrent {
             let chunk = match chunk_queue.pop() {
                 Some(c) => c,
                 None => break,
@@ -265,8 +274,8 @@ pub fn run_parallel(
             active_handles.insert(token, (handle, state));
         }
 
-        // Nothing left to do
-        if active_handles.is_empty() && chunk_queue.is_empty() {
+        // Nothing left to do — either all chunks processed, or time expired and in-flight done
+        if active_handles.is_empty() && (chunk_queue.is_empty() || time_expired) {
             break;
         }
 

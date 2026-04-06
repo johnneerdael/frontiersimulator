@@ -132,17 +132,23 @@ frontier-sim benchmark realdebrid:ABC123:1:52428800000
 
 The tool will resolve the asset key to a direct download URL via the provider API (`/unrestrict/link` for Real-Debrid, `/item/details` for Premiumize) before probing and benchmarking.
 
-**Using a raw URL:**
+**Options:**
 
 ```bash
-# Benchmark a direct URL
-frontier-sim benchmark https://example.com/video.mkv
+# Default: 120 second sustained benchmark (matching Android TV)
+frontier-sim benchmark realdebrid:ABC123:1:52428800000
 
-# Specify download size (default: 32MB)
-frontier-sim benchmark realdebrid:ABC123:1:52428800000 --size 67108864
+# Shorter benchmark (30 seconds)
+frontier-sim benchmark realdebrid:ABC123:1:52428800000 --duration 30
+
+# Limit by bytes instead of time
+frontier-sim benchmark realdebrid:ABC123:1:52428800000 --max-bytes 67108864
 
 # Specify output directory
 frontier-sim benchmark realdebrid:ABC123:1:52428800000 --output ./my-traces
+
+# Benchmark a direct URL
+frontier-sim benchmark https://example.com/video.mkv
 ```
 
 Runs a full parallel benchmark:

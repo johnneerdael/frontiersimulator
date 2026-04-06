@@ -47,9 +47,13 @@ enum Commands {
         /// URL or asset key (e.g., realdebrid:LU3DESWCEVAM4:1:169114151864)
         target: String,
 
-        /// Total bytes to download (default: 32MB)
-        #[arg(long, default_value = "33554432")]
-        size: u64,
+        /// Benchmark duration in seconds (default: 120s, matching Android TV)
+        #[arg(long, default_value = "120")]
+        duration: u64,
+
+        /// Max bytes to download (0 = unlimited, constrained by duration)
+        #[arg(long, default_value = "0")]
+        max_bytes: u64,
 
         /// Output directory for trace files
         #[arg(short, long)]
@@ -206,7 +210,7 @@ fn main() {
             }
         }
 
-        Commands::Benchmark { target, size, output } => {
+        Commands::Benchmark { target, duration, max_bytes, output } => {
             let page_size = (cfg.defaults.page_size_kb as u64) * 1024;
             let chunk_size = (cfg.defaults.chunk_size_mb as u64) * 1024 * 1024;
             let trace_dir = output.unwrap_or_else(|| cfg.output.trace_dir.clone());
@@ -239,10 +243,14 @@ fn main() {
                 }
             };
 
-            let download_size = if let Some(cl) = probe_result.content_length {
-                size.min(cl)
+            // Determine how much of the file to use for benchmarking.
+            // Generate chunks for the full file (or max_bytes if set), but the reactor
+            // will stop starting new chunks once the duration limit expires.
+            let file_size = probe_result.content_length.unwrap_or(u64::MAX);
+            let download_size = if max_bytes > 0 {
+                max_bytes.min(file_size)
             } else {
-                size
+                file_size // entire file — reactor will stop when duration expires
             };
 
             // Build chunk list
@@ -264,12 +272,17 @@ fn main() {
                 });
                 offset = end + 1;
                 chunk_id += 1;
+                // Cap chunk list to avoid huge memory for very large files
+                if chunks.len() >= 10_000 {
+                    break;
+                }
             }
 
             println!(
-                "Benchmarking: {} chunks, {:.1} MB, {} urgent + {} prefetch workers",
+                "Benchmarking: {} chunks queued, {:.1} MB available, {}s duration, {} urgent + {} prefetch workers",
                 chunks.len(),
                 download_size as f64 / 1_048_576.0,
+                duration,
                 cfg.defaults.urgent_workers,
                 cfg.defaults.prefetch_workers,
             );
@@ -321,6 +334,7 @@ fn main() {
                 prefetch_workers: cfg.defaults.prefetch_workers,
                 page_size,
                 sink: cfg.defaults.sink,
+                max_duration: Duration::from_secs(duration),
                 ..ReactorConfig::default()
             };
 
