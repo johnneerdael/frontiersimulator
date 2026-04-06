@@ -371,13 +371,21 @@ pub fn run_parallel(
             let token = next_token;
             next_token += 1;
 
-            // Reuse a pooled Easy2 handle if available (preserves TCP+TLS connection).
-            // IMPORTANT: do NOT call easy.reset() — it calls curl_easy_reset() which
-            // destroys the connection state and forces a new TCP+TLS handshake.
-            // Instead, just reconfigure the options we need (URL, range, timeouts)
-            // and reinit our handler.
+            // Connection reuse strategy: reuse Easy2 handles from the pool.
+            // After remove2(), immediately re-add with new range — the handle
+            // retains its connection state if we don't call reset().
+            // curl reuses the TCP+TLS connection when the same handle connects
+            // to the same host:port.
             let mut easy = if let Some(mut pooled) = handle_pool.pop() {
                 pooled.get_mut().reinit(request_id, chunk.chunk_id, chunk.range_start, config.page_size);
+                // Reconfigure URL — even though it's the same host, curl needs the URL set
+                // for each transfer. Don't reset() — that kills the connection.
+                pooled.url(url).map_err(|e| format!("set URL: {e}"))?;
+                pooled.follow_location(true).map_err(|e| format!("follow: {e}"))?;
+                pooled.timeout(config.request_timeout).map_err(|e| format!("timeout: {e}"))?;
+                pooled.tcp_keepalive(true).map_err(|e| format!("keepalive: {e}"))?;
+                // Clear the range from previous request before setting new one
+                pooled.range("").map_err(|e| format!("clear range: {e}"))?;
                 pooled
             } else {
                 let handler = ReactorHandler::new(
@@ -388,16 +396,13 @@ pub fn run_parallel(
                     event_tx.clone(),
                     run_start,
                 );
-                Easy2::new(handler)
+                let mut e = Easy2::new(handler);
+                e.url(url).map_err(|e| format!("set URL: {e}"))?;
+                e.follow_location(true).map_err(|e| format!("follow: {e}"))?;
+                e.timeout(config.request_timeout).map_err(|e| format!("timeout: {e}"))?;
+                e.tcp_keepalive(true).map_err(|e| format!("keepalive: {e}"))?;
+                e
             };
-
-            easy.url(url).map_err(|e| format!("set URL: {e}"))?;
-            easy.follow_location(true)
-                .map_err(|e| format!("follow: {e}"))?;
-            easy.timeout(config.request_timeout)
-                .map_err(|e| format!("timeout: {e}"))?;
-            easy.tcp_keepalive(true)
-                .map_err(|e| format!("tcp keepalive: {e}"))?;
 
             let range = format!("{}-{}", chunk.range_start, chunk.range_end);
             easy.range(&range)
