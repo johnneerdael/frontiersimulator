@@ -19,3 +19,7 @@ frontier-transport = { path = "../transport" }
 frontier-core = { path = "../frontier" }
 frontier-telemetry = { path = "../telemetry" }
 crossbeam-channel = "0.5"
+
+[features]
+default = []
+vendored-ssl = ["frontier-transport/vendored-ssl"]

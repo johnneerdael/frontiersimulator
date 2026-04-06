@@ -34,8 +34,13 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ matrix.target }}-cargo-
 
-      - name: Build (release)
+      - name: Build (release, native TLS)
+        if: matrix.target == 'aarch64-apple-darwin'
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (release, vendored SSL for cross-compile)
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: cargo build --release --target ${{ matrix.target }} --features vendored-ssl
 
       - name: Run tests
         if: matrix.target == 'aarch64-apple-darwin'

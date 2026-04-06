@@ -9,8 +9,12 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 frontier-telemetry = { path = "../telemetry" }
-curl = { version = "0.4", features = ["poll_7_68_0", "static-ssl"] }
+curl = { version = "0.4", features = ["poll_7_68_0"] }
 curl-sys = "0.4"
-openssl-sys = { version = "0.9", features = ["vendored"] }
 crossbeam-channel = "0.5"
 sha2 = "0.10"
+openssl-sys = { version = "0.9", optional = true }
+
+[features]
+default = []
+vendored-ssl = ["curl/static-ssl", "openssl-sys/vendored"]
