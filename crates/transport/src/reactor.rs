@@ -187,6 +187,18 @@ impl ReactorHandler {
     fn timestamp_ns(&self) -> u64 {
         self.run_start.elapsed().as_nanos() as u64
     }
+
+    /// Reinitialize for a new request, preserving the event_tx and run_start.
+    fn reinit(&mut self, request_id: u64, chunk_id: u64, range_start: u64, page_size: u64) {
+        self.request_id = request_id;
+        self.chunk_id = chunk_id;
+        self.page_size = page_size;
+        self.current_page_bytes = 0;
+        self.current_page_index = range_start / page_size;
+        self.bytes_received = 0;
+        self.headers.clear();
+        self.response_code = None;
+    }
 }
 
 impl Handler for ReactorHandler {
@@ -264,18 +276,32 @@ pub fn run_parallel(
 ) -> Result<ReactorResult, String> {
     let mut multi = Multi::new();
 
-    // Fix 3: Limit concurrent connections to prevent rate limiting
+    // Connection management: limit concurrent connections and grow the cache
     let max_concurrent = (config.urgent_workers + config.prefetch_workers) as usize;
     multi.set_max_host_connections(max_concurrent)
         .map_err(|e| format!("set max host connections: {e}"))?;
-    multi.set_max_total_connections(max_concurrent + 2) // small headroom for redirects
+    multi.set_max_total_connections(max_concurrent + 2)
         .map_err(|e| format!("set max total connections: {e}"))?;
+    // Keep more idle connections in the cache for reuse.
+    // Default is 4 * number of easy handles, but we cycle handles rapidly.
+    // A larger pool increases the chance that a new Easy2 finds a cached connection.
+    multi.set_max_connects(max_concurrent * 4)
+        .map_err(|e| format!("set max connects: {e}"))?;
+    // Enable HTTP pipelining/multiplexing for h2
+    multi.pipelining(false, true)
+        .map_err(|e| format!("pipelining: {e}"))?;
 
     let mut active_handles: HashMap<Token, (Easy2Handle<ReactorHandler>, RequestState)> =
         HashMap::new();
     let mut connections: HashMap<i64, ConnectionRecord> = HashMap::new();
     let mut next_token: Token = 0;
     let mut next_request_id: u64 = 1;
+
+    // Connection reuse: pool of completed Easy2 handles for recycling.
+    // After a request completes, we reset the Easy2 and put it here.
+    // New requests take from the pool first, preserving the underlying
+    // TCP+TLS connection in curl's connection cache.
+    let mut handle_pool: Vec<Easy2<ReactorHandler>> = Vec::new();
 
     // Fix 4: Frontier-aware priority queue instead of flat FIFO
     let mut chunk_queue: BinaryHeap<PrioritizedChunk> = BinaryHeap::new();
@@ -345,23 +371,31 @@ pub fn run_parallel(
             let token = next_token;
             next_token += 1;
 
-            let handler = ReactorHandler::new(
-                request_id,
-                chunk.chunk_id,
-                chunk.range_start,
-                config.page_size,
-                event_tx.clone(),
-                run_start,
-            );
+            // Reuse a pooled Easy2 handle if available (preserves TCP+TLS connection),
+            // otherwise create a new one.
+            let mut easy = if let Some(mut pooled) = handle_pool.pop() {
+                // Reset curl options but keep connection cache
+                pooled.reset();
+                // Reinitialize our handler for the new request
+                pooled.get_mut().reinit(request_id, chunk.chunk_id, chunk.range_start, config.page_size);
+                pooled
+            } else {
+                let handler = ReactorHandler::new(
+                    request_id,
+                    chunk.chunk_id,
+                    chunk.range_start,
+                    config.page_size,
+                    event_tx.clone(),
+                    run_start,
+                );
+                Easy2::new(handler)
+            };
 
-            let mut easy = Easy2::new(handler);
             easy.url(url).map_err(|e| format!("set URL: {e}"))?;
             easy.follow_location(true)
                 .map_err(|e| format!("follow: {e}"))?;
             easy.timeout(config.request_timeout)
                 .map_err(|e| format!("timeout: {e}"))?;
-
-            // Fix 2: Enable TCP keepalive for connection reuse
             easy.tcp_keepalive(true)
                 .map_err(|e| format!("tcp keepalive: {e}"))?;
 
@@ -675,6 +709,10 @@ pub fn run_parallel(
                 } else if !is_complete {
                     failed_chunks += 1;
                 }
+
+                // Recycle the Easy2 handle into the pool for connection reuse.
+                // The underlying TCP+TLS connection stays in curl's cache.
+                handle_pool.push(easy);
             }
         }
     }
