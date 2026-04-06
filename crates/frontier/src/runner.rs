@@ -31,6 +31,7 @@ pub struct FrontierRunResult {
 pub fn run_frontier_tracker(
     event_rx: Receiver<TraceEvent>,
     frontier_tx: Sender<TraceEvent>,
+    feedback_tx: Option<Sender<u64>>,
     run_start: Instant,
     config: FrontierRunConfig,
 ) -> FrontierRunResult {
@@ -58,6 +59,11 @@ pub fn run_frontier_tracker(
                         contiguous_bytes: new_frontier,
                         timestamp_ns: *timestamp_ns,
                     });
+
+                    // Send feedback to reactor for frontier-aware scheduling
+                    if let Some(ref fb_tx) = feedback_tx {
+                        let _ = fb_tx.send(new_frontier);
+                    }
                 }
             }
             _ => {}
@@ -205,7 +211,7 @@ mod tests {
         }
         drop(reactor_tx);
 
-        let result = run_frontier_tracker(reactor_rx, frontier_tx, run_start, config);
+        let result = run_frontier_tracker(reactor_rx, frontier_tx, None, run_start, config);
 
         assert_eq!(result.final_frontier_bytes, 10 * 128 * 1024);
         assert!(result.frontier_events_count > 0);

@@ -315,7 +315,7 @@ fn main() {
                 timestamp_ns: 0,
             });
 
-            // Spawn frontier tracker thread
+            // Spawn frontier tracker thread with feedback channel to reactor
             let frontier_config = FrontierRunConfig {
                 page_size,
                 chunk_size_bytes: chunk_size,
@@ -324,11 +324,14 @@ fn main() {
                 range_support: probe_result.range_support,
             };
 
+            // Feedback channel: frontier tracker → reactor (frontier byte position)
+            let (feedback_tx, feedback_rx) = crossbeam_channel::unbounded::<u64>();
+
             let frontier_handle = std::thread::spawn(move || {
-                run_frontier_tracker(reactor_rx, frontier_tx, run_start, frontier_config)
+                run_frontier_tracker(reactor_rx, frontier_tx, Some(feedback_tx), run_start, frontier_config)
             });
 
-            // Run reactor
+            // Run reactor with frontier feedback
             let reactor_config = ReactorConfig {
                 urgent_workers: cfg.defaults.urgent_workers,
                 prefetch_workers: cfg.defaults.prefetch_workers,
@@ -339,7 +342,7 @@ fn main() {
             };
 
             let reactor_result =
-                reactor::run_parallel(&url, &chunks, &reactor_config, &reactor_tx, run_start);
+                reactor::run_parallel(&url, &chunks, &reactor_config, &reactor_tx, Some(feedback_rx), run_start);
 
             // Close reactor channel to signal frontier tracker
             drop(reactor_tx);
@@ -400,7 +403,8 @@ fn main() {
                     r.duration_ms / 1000.0,
                     r.total_bytes as f64 * 8.0 / r.duration_ms / 1000.0,
                 );
-                println!("Requests: {} across {} connections", r.total_requests, r.total_connections);
+                println!("Requests: {} across {} connections ({} retried, {} failed)",
+                    r.total_requests, r.total_connections, r.retried_chunks, r.failed_chunks);
             }
             println!("Frontier: {:.1} MB contiguous, {} events, {} stalls (max {:.1}s)",
                 frontier_result.final_frontier_bytes as f64 / 1_048_576.0,
