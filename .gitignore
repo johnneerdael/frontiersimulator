@@ -1,0 +1,6 @@
+/target
+/traces
+/frontier.db
+frontier.toml
+Cargo.lock
+.omc/

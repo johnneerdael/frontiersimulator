@@ -1,0 +1,11 @@
+[package]
+name = "frontier-telemetry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+crossbeam-channel = "0.5"
+rusqlite = { version = "0.35", features = ["bundled"] }

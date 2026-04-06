@@ -1,0 +1,15 @@
+[package]
+name = "frontier-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+frontier-telemetry = { path = "../telemetry" }
+curl = { version = "0.4", features = ["poll_7_68_0"] }
+curl-sys = "0.4"
+crossbeam-channel = "0.5"
+sha2 = "0.10"

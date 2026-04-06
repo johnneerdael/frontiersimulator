@@ -1,0 +1,11 @@
+[package]
+name = "frontier-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+crossbeam-channel = "0.5"
+frontier-telemetry = { path = "../telemetry" }

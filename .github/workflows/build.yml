@@ -1,0 +1,87 @@
+name: Build macOS CLI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
+
+      - name: Build (release)
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Run tests
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: cargo test --release
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/frontier-sim dist/frontier-sim-${{ matrix.target }}
+          chmod +x dist/frontier-sim-${{ matrix.target }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontier-sim-${{ matrix.target }}
+          path: dist/frontier-sim-${{ matrix.target }}
+
+  universal:
+    needs: build
+    runs-on: macos-latest
+    steps:
+      - name: Download x86_64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: frontier-sim-x86_64-apple-darwin
+          path: binaries
+
+      - name: Download aarch64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: frontier-sim-aarch64-apple-darwin
+          path: binaries
+
+      - name: Create universal binary
+        run: |
+          chmod +x binaries/frontier-sim-x86_64-apple-darwin
+          chmod +x binaries/frontier-sim-aarch64-apple-darwin
+          lipo -create \
+            binaries/frontier-sim-x86_64-apple-darwin \
+            binaries/frontier-sim-aarch64-apple-darwin \
+            -output frontier-sim-universal
+          chmod +x frontier-sim-universal
+          file frontier-sim-universal
+
+      - name: Upload universal binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontier-sim-universal-macos
+          path: frontier-sim-universal

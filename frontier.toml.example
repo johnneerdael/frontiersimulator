@@ -1,0 +1,21 @@
+# Frontier Simulator configuration
+# API keys can also be set via environment variables:
+#   REALDEBRID_API_KEY, PREMIUMIZE_API_KEY
+
+[providers.realdebrid]
+api_key = "YOUR_REALDEBRID_API_KEY"
+
+[providers.premiumize]
+api_key = "YOUR_PREMIUMIZE_API_KEY"
+
+[defaults]
+chunk_size_mb = 4
+page_size_kb = 128
+urgent_workers = 2
+prefetch_workers = 1
+protocol = "auto"    # auto | h1 | h2
+sink = "discard"     # discard | sparse-file | rolling-ring
+
+[output]
+trace_dir = "./traces"
+db_path = "./frontier.db"
