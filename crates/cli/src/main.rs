@@ -42,10 +42,10 @@ enum Commands {
         url: String,
     },
 
-    /// Run a full parallel benchmark against a URL
+    /// Run a full parallel benchmark against a URL or asset key
     Benchmark {
-        /// URL to benchmark
-        url: String,
+        /// URL or asset key (e.g., realdebrid:LU3DESWCEVAM4:1:169114151864)
+        target: String,
 
         /// Total bytes to download (default: 32MB)
         #[arg(long, default_value = "33554432")]
@@ -205,7 +205,7 @@ fn main() {
             }
         }
 
-        Commands::Benchmark { url, size, output } => {
+        Commands::Benchmark { target, size, output } => {
             let page_size = (cfg.defaults.page_size_kb as u64) * 1024;
             let chunk_size = (cfg.defaults.chunk_size_mb as u64) * 1024 * 1024;
             let trace_dir = output.unwrap_or_else(|| cfg.output.trace_dir.clone());
@@ -218,6 +218,61 @@ fn main() {
             );
             let trace_path = PathBuf::from(&trace_dir).join(&run_id).join("trace.jsonl");
             let summary_path = PathBuf::from(&trace_dir).join(&run_id).join("summary.json");
+
+            // Resolve target: asset key (provider:id:...) or raw URL
+            let (url, asset_key) = if target.starts_with("http://") || target.starts_with("https://") {
+                (target.clone(), target.clone())
+            } else {
+                // Parse as asset key: provider:item_id:file_index:size
+                let parts: Vec<&str> = target.splitn(4, ':').collect();
+                if parts.len() < 2 {
+                    eprintln!("Invalid target. Use a URL or asset key (e.g., realdebrid:ID:FILE_INDEX:SIZE)");
+                    std::process::exit(1);
+                }
+                let provider_name = parts[0];
+                let providers = build_providers(&cfg, Some(provider_name));
+                if providers.is_empty() {
+                    eprintln!("Provider '{}' not configured. Check frontier.toml or environment variables.", provider_name);
+                    std::process::exit(1);
+                }
+                let provider = &providers[0];
+
+                // Find the matching asset
+                println!("Resolving asset key: {target}");
+                let candidates = match provider.list_candidates() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("Failed to list candidates: {e}");
+                        std::process::exit(1);
+                    }
+                };
+                let asset = candidates
+                    .iter()
+                    .find(|a| a.key.canonical() == target)
+                    .cloned();
+                let asset = match asset {
+                    Some(a) => a,
+                    None => {
+                        eprintln!("Asset key not found: {target}");
+                        eprintln!("Available assets:");
+                        for a in &candidates {
+                            eprintln!("  {}", a.key.canonical());
+                        }
+                        std::process::exit(1);
+                    }
+                };
+
+                println!("Resolving direct URL for: {} ({:.1} MB)", asset.filename, asset.key.size_bytes as f64 / 1_048_576.0);
+                let resolved = match provider.resolve_direct_url(&asset) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("Failed to resolve direct URL: {e}");
+                        std::process::exit(1);
+                    }
+                };
+                println!("Direct URL resolved ({} bytes)", resolved.size_bytes);
+                (resolved.direct_url, target.clone())
+            };
 
             // Probe first
             println!("Probing: {url}");
@@ -287,7 +342,7 @@ fn main() {
             // Emit run_started
             let _ = reactor_tx.send(frontier_telemetry::TraceEvent::RunStarted {
                 run_id: run_id.clone(),
-                asset_key: url.clone(),
+                asset_key: asset_key.clone(),
                 config: serde_json::json!({
                     "chunk_size_mb": cfg.defaults.chunk_size_mb,
                     "page_size_kb": cfg.defaults.page_size_kb,
@@ -342,6 +397,7 @@ fn main() {
             let summary = serde_json::json!({
                 "run_id": run_id,
                 "url": url,
+                "asset_key": asset_key,
                 "download_size": download_size,
                 "chunks": chunks.len(),
                 "reactor": {
@@ -408,7 +464,7 @@ fn main() {
                     "urgent_workers": cfg.defaults.urgent_workers,
                     "prefetch_workers": cfg.defaults.prefetch_workers,
                 }).to_string();
-                let _ = db::insert_run(&db_conn, &run_id, &url, "", started_at_ms, &config_json);
+                let _ = db::insert_run(&db_conn, &run_id, &asset_key, "", started_at_ms, &config_json);
                 let envelope_json = serde_json::to_string(&frontier_result.envelope).unwrap_or_default();
                 let sum_json = serde_json::to_string(&summary).unwrap_or_default();
                 let _ = db::finish_run(&db_conn, &run_id, started_at_ms, &envelope_json, &sum_json);
