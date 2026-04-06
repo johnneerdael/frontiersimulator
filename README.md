@@ -114,26 +114,47 @@ Probes a URL to determine:
 
 ### Run a benchmark
 
+The benchmark command accepts either a **stable asset key** (recommended) or a raw URL.
+
+**Using an asset key (recommended workflow):**
+
 ```bash
-# Benchmark with default settings (32MB download)
+# Step 1: List available assets from your provider
+frontier-sim providers list --provider realdebrid
+
+# Output:
+#   [0] Movie.2160p.BluRay.REMUX.mkv (50000.0 MB) [realdebrid:ABC123:1:52428800000]
+#   [1] Show.S01E01.1080p.mkv (5000.0 MB) [realdebrid:DEF456:3:5242880000]
+
+# Step 2: Copy the asset key from the listing and run the benchmark
+frontier-sim benchmark realdebrid:ABC123:1:52428800000
+```
+
+The tool will resolve the asset key to a direct download URL via the provider API (`/unrestrict/link` for Real-Debrid, `/item/details` for Premiumize) before probing and benchmarking.
+
+**Using a raw URL:**
+
+```bash
+# Benchmark a direct URL
 frontier-sim benchmark https://example.com/video.mkv
 
-# Specify download size
-frontier-sim benchmark https://example.com/video.mkv --size 67108864
+# Specify download size (default: 32MB)
+frontier-sim benchmark realdebrid:ABC123:1:52428800000 --size 67108864
 
 # Specify output directory
-frontier-sim benchmark https://example.com/video.mkv --output ./my-traces
+frontier-sim benchmark realdebrid:ABC123:1:52428800000 --output ./my-traces
 ```
 
 Runs a full parallel benchmark:
-1. Probes the URL for range support and content length
-2. Splits the download into chunks across urgent and prefetch lanes
-3. Downloads chunks in parallel via libcurl multi
-4. Tracks page-level frontier advancement (128KB pages)
-5. Detects stalls and performs suffix resume for urgent requests
-6. Runs shadow player simulation to find max sustainable bitrate
-7. Generates a capability envelope
-8. Writes JSONL trace + JSON summary + SQLite record
+1. Resolves asset key to direct URL (if asset key provided)
+2. Probes the URL for range support and content length
+3. Splits the download into chunks across urgent and prefetch lanes
+4. Downloads chunks in parallel via libcurl multi
+5. Tracks page-level frontier advancement (128KB pages)
+6. Detects stalls and performs suffix resume for urgent requests
+7. Runs shadow player simulation to find max sustainable bitrate
+8. Generates a capability envelope
+9. Writes JSONL trace + JSON summary + SQLite record
 
 **Output files:**
 
