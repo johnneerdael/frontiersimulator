@@ -12,6 +12,12 @@ use frontier_telemetry::events::Lane;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+mod libc_signal {
+    extern "C" {
+        pub fn kill(pid: i32, sig: i32) -> i32;
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "frontier-sim")]
 #[command(about = "macOS frontier simulator — transport-level benchmarking for debrid providers")]
@@ -62,6 +68,10 @@ enum Commands {
         /// Number of urgent workers (default: from config)
         #[arg(long)]
         workers: Option<u32>,
+
+        /// Capture a pcap file of all CDN traffic (requires sudo for tcpdump)
+        #[arg(long)]
+        pcap: bool,
 
         /// Output directory for trace files
         #[arg(short, long)]
@@ -218,7 +228,7 @@ fn main() {
             }
         }
 
-        Commands::Benchmark { target, duration, max_bytes, chunk_size_mb, workers, output } => {
+        Commands::Benchmark { target, duration, max_bytes, chunk_size_mb, workers, pcap, output } => {
             let page_size = (cfg.defaults.page_size_kb as u64) * 1024;
             let effective_chunk_mb = chunk_size_mb.unwrap_or(cfg.defaults.chunk_size_mb);
             let chunk_size = (effective_chunk_mb as u64) * 1024 * 1024;
@@ -251,6 +261,50 @@ fn main() {
                     eprintln!("Probe failed: {e}");
                     std::process::exit(1);
                 }
+            };
+
+            // Start pcap capture if requested
+            let mut tcpdump_child: Option<std::process::Child> = None;
+            let pcap_path = if pcap {
+                let pcap_file = PathBuf::from(&trace_dir).join(&run_id).join("capture.pcap");
+                if let Some(parent) = pcap_file.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                // Extract CDN IP from probe result (format: "ip:port")
+                let cdn_ip = probe_result.remote_endpoint
+                    .split(':')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                if !cdn_ip.is_empty() {
+                    println!("Starting pcap capture (host {cdn_ip}) -> {}", pcap_file.display());
+                    println!("  Note: requires sudo or BPF access. Run with: sudo ./frontier-sim benchmark ... --pcap");
+                    match std::process::Command::new("tcpdump")
+                        .args([
+                            "-i", "any",
+                            "-w", pcap_file.to_str().unwrap_or("capture.pcap"),
+                            "-s", "0",        // full packet capture
+                            "host", &cdn_ip,
+                        ])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::piped())
+                        .spawn()
+                    {
+                        Ok(child) => {
+                            tcpdump_child = Some(child);
+                            // Give tcpdump a moment to start
+                            std::thread::sleep(Duration::from_millis(500));
+                            println!("  pcap capture running (PID {})", tcpdump_child.as_ref().unwrap().id());
+                        }
+                        Err(e) => {
+                            eprintln!("  Failed to start tcpdump: {e}");
+                            eprintln!("  Try: sudo ./frontier-sim benchmark ... --pcap");
+                        }
+                    }
+                }
+                Some(pcap_file)
+            } else {
+                None
             };
 
             // Determine how much of the file to use for benchmarking.
@@ -471,6 +525,25 @@ fn main() {
                 }
 
                 println!("SQLite: {}", db_path.display());
+            }
+
+            // Stop pcap capture
+            if let Some(mut child) = tcpdump_child {
+                // Send SIGINT to tcpdump for clean shutdown (flushes buffers)
+                unsafe {
+                    libc_signal::kill(child.id() as i32, 2); // SIGINT
+                }
+                std::thread::sleep(Duration::from_millis(500));
+                let _ = child.wait();
+                if let Some(ref pcap_file) = pcap_path {
+                    if pcap_file.exists() {
+                        let size = std::fs::metadata(pcap_file).map(|m| m.len()).unwrap_or(0);
+                        println!("pcap: {} ({:.1} MB)", pcap_file.display(), size as f64 / 1_048_576.0);
+                        println!("  Open with: wireshark {}", pcap_file.display());
+                        println!("  Filter: tcp.flags.reset == 1  (to see RST packets)");
+                        println!("  Filter: ssl.handshake  (to see TLS handshakes)");
+                    }
+                }
             }
         }
 
