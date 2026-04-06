@@ -371,12 +371,12 @@ pub fn run_parallel(
             let token = next_token;
             next_token += 1;
 
-            // Reuse a pooled Easy2 handle if available (preserves TCP+TLS connection),
-            // otherwise create a new one.
+            // Reuse a pooled Easy2 handle if available (preserves TCP+TLS connection).
+            // IMPORTANT: do NOT call easy.reset() — it calls curl_easy_reset() which
+            // destroys the connection state and forces a new TCP+TLS handshake.
+            // Instead, just reconfigure the options we need (URL, range, timeouts)
+            // and reinit our handler.
             let mut easy = if let Some(mut pooled) = handle_pool.pop() {
-                // Reset curl options but keep connection cache
-                pooled.reset();
-                // Reinitialize our handler for the new request
                 pooled.get_mut().reinit(request_id, chunk.chunk_id, chunk.range_start, config.page_size);
                 pooled
             } else {
