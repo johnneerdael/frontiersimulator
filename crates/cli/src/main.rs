@@ -36,10 +36,10 @@ enum Commands {
         action: ProviderAction,
     },
 
-    /// Probe a URL for range support and timing facts
+    /// Probe a URL or asset key for range support and timing facts
     Probe {
-        /// URL to probe
-        url: String,
+        /// URL or asset key (e.g., realdebrid:LU3DESWCEVAM4:1:169114151864)
+        target: String,
     },
 
     /// Run a full parallel benchmark against a URL or asset key
@@ -173,7 +173,8 @@ fn main() {
             }
         },
 
-        Commands::Probe { url } => {
+        Commands::Probe { target } => {
+            let url = resolve_target(&target, &cfg);
             println!("Probing: {url}");
             match probe::probe_url(&url, Duration::from_secs(30)) {
                 Ok(result) => {
@@ -219,60 +220,8 @@ fn main() {
             let trace_path = PathBuf::from(&trace_dir).join(&run_id).join("trace.jsonl");
             let summary_path = PathBuf::from(&trace_dir).join(&run_id).join("summary.json");
 
-            // Resolve target: asset key (provider:id:...) or raw URL
-            let (url, asset_key) = if target.starts_with("http://") || target.starts_with("https://") {
-                (target.clone(), target.clone())
-            } else {
-                // Parse as asset key: provider:item_id:file_index:size
-                let parts: Vec<&str> = target.splitn(4, ':').collect();
-                if parts.len() < 2 {
-                    eprintln!("Invalid target. Use a URL or asset key (e.g., realdebrid:ID:FILE_INDEX:SIZE)");
-                    std::process::exit(1);
-                }
-                let provider_name = parts[0];
-                let providers = build_providers(&cfg, Some(provider_name));
-                if providers.is_empty() {
-                    eprintln!("Provider '{}' not configured. Check frontier.toml or environment variables.", provider_name);
-                    std::process::exit(1);
-                }
-                let provider = &providers[0];
-
-                // Find the matching asset
-                println!("Resolving asset key: {target}");
-                let candidates = match provider.list_candidates() {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("Failed to list candidates: {e}");
-                        std::process::exit(1);
-                    }
-                };
-                let asset = candidates
-                    .iter()
-                    .find(|a| a.key.canonical() == target)
-                    .cloned();
-                let asset = match asset {
-                    Some(a) => a,
-                    None => {
-                        eprintln!("Asset key not found: {target}");
-                        eprintln!("Available assets:");
-                        for a in &candidates {
-                            eprintln!("  {}", a.key.canonical());
-                        }
-                        std::process::exit(1);
-                    }
-                };
-
-                println!("Resolving direct URL for: {} ({:.1} MB)", asset.filename, asset.key.size_bytes as f64 / 1_048_576.0);
-                let resolved = match provider.resolve_direct_url(&asset) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        eprintln!("Failed to resolve direct URL: {e}");
-                        std::process::exit(1);
-                    }
-                };
-                println!("Direct URL resolved ({} bytes)", resolved.size_bytes);
-                (resolved.direct_url, target.clone())
-            };
+            let url = resolve_target(&target, &cfg);
+            let asset_key = target.clone();
 
             // Probe first
             println!("Probing: {url}");
@@ -648,6 +597,60 @@ fn main() {
             }
         }
     }
+}
+
+/// Resolve a target string to a URL. If it starts with http:// or https://,
+/// return it as-is. Otherwise treat it as an asset key (provider:id:...) and
+/// resolve via the provider adapter.
+fn resolve_target(target: &str, cfg: &config::Config) -> String {
+    if target.starts_with("http://") || target.starts_with("https://") {
+        return target.to_string();
+    }
+
+    let parts: Vec<&str> = target.splitn(4, ':').collect();
+    if parts.len() < 2 {
+        eprintln!("Invalid target. Use a URL or asset key (e.g., realdebrid:ID:FILE_INDEX:SIZE)");
+        std::process::exit(1);
+    }
+    let provider_name = parts[0];
+    let providers = build_providers(cfg, Some(provider_name));
+    if providers.is_empty() {
+        eprintln!("Provider '{}' not configured. Check frontier.toml or environment variables.", provider_name);
+        std::process::exit(1);
+    }
+    let provider = &providers[0];
+
+    println!("Resolving asset key: {target}");
+    let candidates = match provider.list_candidates() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to list candidates: {e}");
+            std::process::exit(1);
+        }
+    };
+    let asset = candidates.iter().find(|a| a.key.canonical() == target).cloned();
+    let asset = match asset {
+        Some(a) => a,
+        None => {
+            eprintln!("Asset key not found: {target}");
+            eprintln!("Available assets:");
+            for a in &candidates {
+                eprintln!("  {}", a.key.canonical());
+            }
+            std::process::exit(1);
+        }
+    };
+
+    println!("Resolving direct URL for: {} ({:.1} MB)", asset.filename, asset.key.size_bytes as f64 / 1_048_576.0);
+    let resolved = match provider.resolve_direct_url(&asset) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Failed to resolve direct URL: {e}");
+            std::process::exit(1);
+        }
+    };
+    println!("Direct URL resolved ({} bytes)", resolved.size_bytes);
+    resolved.direct_url
 }
 
 fn build_providers(
