@@ -7,7 +7,7 @@ const DEFAULT_MAX_BUFFER_MS: u64 = 50_000;
 const DEFAULT_SAFETY_FACTOR: f64 = 0.85;
 const DEFAULT_SEARCH_TOLERANCE_MBPS: f64 = 0.1;
 const DEFAULT_MIN_BITRATE_MBPS: f64 = 1.0;
-const DEFAULT_MAX_BITRATE_MBPS: f64 = 500.0;
+const DEFAULT_MAX_BITRATE_MBPS: f64 = 2000.0;
 
 /// Result of a single simulation run at a candidate bitrate.
 #[derive(Debug, Clone)]
