@@ -10,19 +10,14 @@
 
 use crate::curl_ffi;
 use crate::download::PAGE_SIZE;
-use crate::Sink;
+use crate::{negotiated_http_version, ProtocolMode, Sink};
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use curl::easy::{Easy2, Handler, WriteError};
-use frontier_telemetry::events::{ErrorClass, Lane, StallClass, TraceEvent};
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use frontier_telemetry::events::{ErrorClass, Lane, TraceEvent};
 use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-#[allow(non_camel_case_types)]
-mod libc_types {
-    pub type c_long = i64;
-}
 
 /// Stall threshold — matches Kotlin's STALL_THRESHOLD_MS = 2000.
 const STALL_THRESHOLD_MS: u64 = 2_000;
@@ -38,6 +33,7 @@ pub struct ReactorConfig {
     pub urgent_workers: u32,
     pub prefetch_workers: u32,
     pub page_size: u64,
+    pub protocol: ProtocolMode,
     pub sink: Sink,
     pub stall_timeout: Duration,
     pub request_timeout: Duration,
@@ -50,6 +46,7 @@ impl Default for ReactorConfig {
             urgent_workers: 2,
             prefetch_workers: 1,
             page_size: PAGE_SIZE,
+            protocol: ProtocolMode::Auto,
             sink: Sink::Discard,
             stall_timeout: Duration::from_millis(STALL_THRESHOLD_MS),
             request_timeout: Duration::from_secs(60),
@@ -216,7 +213,8 @@ impl Handler for WorkerHandler {
                 }
             }
             if let Some((key, value)) = trimmed.split_once(':') {
-                self.headers.push((key.trim().to_lowercase(), value.trim().to_string()));
+                self.headers
+                    .push((key.trim().to_lowercase(), value.trim().to_string()));
             }
         }
         true
@@ -274,18 +272,19 @@ pub fn run_parallel(
         }
     }
 
-    let mut next_request_id = Arc::new(Mutex::new(1u64));
+    let next_request_id = Arc::new(Mutex::new(1u64));
 
     // Spawn worker threads — each keeps a persistent Easy2 handle
     let mut worker_handles = Vec::new();
-    for worker_id in 0..max_concurrent {
+    for _worker_id in 0..max_concurrent {
         let url = url.to_string();
         let shared = Arc::clone(&shared);
         let event_tx = event_tx.clone();
         let next_rid = Arc::clone(&next_request_id);
         let page_size = config.page_size;
+        let protocol = config.protocol;
         let request_timeout = config.request_timeout;
-        let stall_timeout = config.stall_timeout;
+        let _stall_timeout = config.stall_timeout;
         let max_duration = config.max_duration;
 
         let handle = std::thread::spawn(move || {
@@ -296,6 +295,9 @@ pub fn run_parallel(
             easy.follow_location(true).unwrap();
             easy.timeout(request_timeout).unwrap();
             easy.tcp_keepalive(true).unwrap();
+            protocol
+                .apply_to(&mut easy)
+                .expect("set requested protocol");
 
             loop {
                 // Check time
@@ -360,7 +362,8 @@ pub fn run_parallel(
                 let range = format!("{}-{}", chunk.range_start, chunk.range_end);
 
                 // Reinit handler for new request
-                easy.get_mut().reinit(request_id, chunk.chunk_id, chunk.range_start);
+                easy.get_mut()
+                    .reinit(request_id, chunk.chunk_id, chunk.range_start);
 
                 // Set new range (URL stays the same — connection reused!)
                 easy.range(&range).unwrap();
@@ -399,20 +402,43 @@ pub fn run_parallel(
                 }
 
                 // Extract timings
-                let dns_ms = easy.namelookup_time().map(|d| d.as_secs_f64() * 1000.0).unwrap_or(0.0);
-                let connect_ms = easy.connect_time().map(|d| d.as_secs_f64() * 1000.0).unwrap_or(0.0);
-                let appconnect_ms = easy.appconnect_time().map(|d| d.as_secs_f64() * 1000.0).unwrap_or(0.0);
+                let dns_ms = easy
+                    .namelookup_time()
+                    .map(|d| d.as_secs_f64() * 1000.0)
+                    .unwrap_or(0.0);
+                let connect_ms = easy
+                    .connect_time()
+                    .map(|d| d.as_secs_f64() * 1000.0)
+                    .unwrap_or(0.0);
+                let appconnect_ms = easy
+                    .appconnect_time()
+                    .map(|d| d.as_secs_f64() * 1000.0)
+                    .unwrap_or(0.0);
                 let tls_ms = (appconnect_ms - connect_ms).max(0.0);
-                let ttfb_ms = easy.starttransfer_time().map(|d| d.as_secs_f64() * 1000.0).unwrap_or(0.0);
-                let total_ms = easy.total_time().map(|d| d.as_secs_f64() * 1000.0).unwrap_or(0.0);
+                let ttfb_ms = easy
+                    .starttransfer_time()
+                    .map(|d| d.as_secs_f64() * 1000.0)
+                    .unwrap_or(0.0);
+                let total_ms = easy
+                    .total_time()
+                    .map(|d| d.as_secs_f64() * 1000.0)
+                    .unwrap_or(0.0);
 
                 let raw = easy.raw();
                 let (conn_id, queue_us, remote_ep, local_ep) = unsafe {
                     (
                         curl_ffi::get_conn_id(raw),
                         curl_ffi::get_queue_time_us(raw),
-                        format!("{}:{}", curl_ffi::get_primary_ip(raw), curl_ffi::get_primary_port(raw)),
-                        format!("{}:{}", curl_ffi::get_local_ip(raw), curl_ffi::get_local_port(raw)),
+                        format!(
+                            "{}:{}",
+                            curl_ffi::get_primary_ip(raw),
+                            curl_ffi::get_primary_port(raw)
+                        ),
+                        format!(
+                            "{}:{}",
+                            curl_ffi::get_local_ip(raw),
+                            curl_ffi::get_local_port(raw)
+                        ),
                     )
                 };
                 let queue_ms = queue_us as f64 / 1000.0;
@@ -423,13 +449,21 @@ pub fn run_parallel(
                     let desc = format!("{e}").to_lowercase();
                     if desc.contains("timeout") || desc.contains("timed out") {
                         ErrorClass::Timeout
-                    } else if desc.contains("reset") || (desc.contains("connection") && desc.contains("refused")) {
+                    } else if desc.contains("reset")
+                        || (desc.contains("connection") && desc.contains("refused"))
+                    {
                         ErrorClass::ConnectionReset
                     } else if desc.contains("resolve") || desc.contains("dns") {
                         ErrorClass::DnsFailure
-                    } else if desc.contains("ssl") || desc.contains("tls") || desc.contains("certificate") {
+                    } else if desc.contains("ssl")
+                        || desc.contains("tls")
+                        || desc.contains("certificate")
+                    {
                         ErrorClass::TlsFailure
-                    } else if desc.contains("recv") || desc.contains("eof") || desc.contains("closed") {
+                    } else if desc.contains("recv")
+                        || desc.contains("eof")
+                        || desc.contains("closed")
+                    {
                         ErrorClass::RecvError
                     } else {
                         ErrorClass::Other
@@ -437,32 +471,32 @@ pub fn run_parallel(
                 });
                 let error_class = error_class.or_else(|| {
                     if let Some(code) = handler.response_code {
-                        if code >= 400 { return Some(ErrorClass::HttpError); }
+                        if code >= 400 {
+                            return Some(ErrorClass::HttpError);
+                        }
                     }
                     None
                 });
 
                 // HTTP version
-                let http_version = {
-                    let mut http_ver: libc_types::c_long = 0;
-                    let curlinfo_http_version = 0x200000 + 46;
-                    let got = unsafe {
-                        curl_sys::curl_easy_getinfo(raw, curlinfo_http_version, &mut http_ver as *mut libc_types::c_long) == curl_sys::CURLE_OK
-                    };
-                    if got {
-                        match http_ver { 2 => "h1.1", 3 => "h2", 4 => "h3", _ => "unknown" }.to_string()
-                    } else {
-                        "unknown".to_string()
-                    }
-                };
+                let http_version = negotiated_http_version(raw);
 
-                let protocol_str = format!("{}{}", if tls_ms > 0.0 { "https/" } else { "http/" }, http_version);
+                let protocol_str = format!(
+                    "{}{}",
+                    if tls_ms > 0.0 { "https/" } else { "http/" },
+                    http_version
+                );
 
                 // Emit request_finished
                 let _ = event_tx.send(TraceEvent::RequestFinished {
                     request_id,
                     total_bytes: bytes,
-                    dns_ms, connect_ms, tls_ms, ttfb_ms, queue_ms, total_ms,
+                    dns_ms,
+                    connect_ms,
+                    tls_ms,
+                    ttfb_ms,
+                    queue_ms,
+                    total_ms,
                     http_version: http_version.clone(),
                     connection_id: conn_id,
                     new_connection,
@@ -489,16 +523,20 @@ pub fn run_parallel(
 
                     // Connection registry
                     let ts_ns = run_start.elapsed().as_nanos() as u64;
-                    let conn = state.connections.entry(conn_id).or_insert_with(|| ConnectionRecord {
-                        connection_id: conn_id,
-                        protocol: protocol_str,
-                        local_endpoint: local_ep,
-                        remote_endpoint: remote_ep,
-                        first_use_ns: ts_ns,
-                        last_use_ns: ts_ns,
-                        requests_count: 0,
-                        bytes_total: 0,
-                    });
+                    let conn =
+                        state
+                            .connections
+                            .entry(conn_id)
+                            .or_insert_with(|| ConnectionRecord {
+                                connection_id: conn_id,
+                                protocol: protocol_str,
+                                local_endpoint: local_ep,
+                                remote_endpoint: remote_ep,
+                                first_use_ns: ts_ns,
+                                last_use_ns: ts_ns,
+                                requests_count: 0,
+                                bytes_total: 0,
+                            });
                     conn.last_use_ns = ts_ns;
                     conn.requests_count += 1;
                     conn.bytes_total += bytes;
@@ -509,9 +547,13 @@ pub fn run_parallel(
                         let suffix_start = chunk.range_start + bytes;
                         state.retried_chunks += 1;
 
-                        let chunk_start = chunk.chunk_id * (chunk.range_end - chunk.range_start + 1);
-                        let is_frontier_blocker = chunk_start <= state.frontier_byte + page_size;
-                        let retry_lane = if is_frontier_blocker { Lane::Urgent } else { chunk.lane };
+                        let is_frontier_blocker =
+                            chunk.range_start <= state.frontier_byte + page_size;
+                        let retry_lane = if is_frontier_blocker {
+                            Lane::Urgent
+                        } else {
+                            chunk.lane
+                        };
 
                         let backoff_ms = if is_frontier_blocker {
                             500 * (1u64 << (attempt - 1).min(4))
@@ -547,19 +589,17 @@ pub fn run_parallel(
     // Coordinator: read frontier feedback and update shared state
     if let Some(frontier_rx) = frontier_rx {
         let shared_coord = Arc::clone(&shared);
-        std::thread::spawn(move || {
-            loop {
-                match frontier_rx.try_recv() {
-                    Ok(frontier_byte) => {
-                        if let Ok(mut state) = shared_coord.lock() {
-                            state.frontier_byte = frontier_byte;
-                        }
+        std::thread::spawn(move || loop {
+            match frontier_rx.try_recv() {
+                Ok(frontier_byte) => {
+                    if let Ok(mut state) = shared_coord.lock() {
+                        state.frontier_byte = frontier_byte;
                     }
-                    Err(TryRecvError::Empty) => {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(TryRecvError::Disconnected) => break,
                 }
+                Err(TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(TryRecvError::Disconnected) => break,
             }
         });
     }
@@ -606,12 +646,20 @@ mod tests {
     fn priority_queue_urgent_first() {
         let mut queue = BinaryHeap::new();
         queue.push(PrioritizedChunk {
-            chunk_id: 1, range_start: 4*1024*1024, range_end: 8*1024*1024-1,
-            lane: Lane::Prefetch, attempt: 0, retry_after: None,
+            chunk_id: 1,
+            range_start: 4 * 1024 * 1024,
+            range_end: 8 * 1024 * 1024 - 1,
+            lane: Lane::Prefetch,
+            attempt: 0,
+            retry_after: None,
         });
         queue.push(PrioritizedChunk {
-            chunk_id: 0, range_start: 0, range_end: 4*1024*1024-1,
-            lane: Lane::Urgent, attempt: 0, retry_after: None,
+            chunk_id: 0,
+            range_start: 0,
+            range_end: 4 * 1024 * 1024 - 1,
+            lane: Lane::Urgent,
+            attempt: 0,
+            retry_after: None,
         });
         assert_eq!(queue.pop().unwrap().lane, Lane::Urgent);
     }
@@ -620,12 +668,20 @@ mod tests {
     fn priority_queue_lower_offset_first() {
         let mut queue = BinaryHeap::new();
         queue.push(PrioritizedChunk {
-            chunk_id: 2, range_start: 8*1024*1024, range_end: 12*1024*1024-1,
-            lane: Lane::Prefetch, attempt: 0, retry_after: None,
+            chunk_id: 2,
+            range_start: 8 * 1024 * 1024,
+            range_end: 12 * 1024 * 1024 - 1,
+            lane: Lane::Prefetch,
+            attempt: 0,
+            retry_after: None,
         });
         queue.push(PrioritizedChunk {
-            chunk_id: 1, range_start: 4*1024*1024, range_end: 8*1024*1024-1,
-            lane: Lane::Prefetch, attempt: 0, retry_after: None,
+            chunk_id: 1,
+            range_start: 4 * 1024 * 1024,
+            range_end: 8 * 1024 * 1024 - 1,
+            lane: Lane::Prefetch,
+            attempt: 0,
+            retry_after: None,
         });
         assert_eq!(queue.pop().unwrap().chunk_id, 1);
     }
@@ -633,11 +689,14 @@ mod tests {
     #[test]
     fn connection_record_defaults() {
         let record = ConnectionRecord {
-            connection_id: 42, protocol: "https/h2".to_string(),
+            connection_id: 42,
+            protocol: "https/h2".to_string(),
             local_endpoint: "127.0.0.1:5000".to_string(),
             remote_endpoint: "93.184.216.34:443".to_string(),
-            first_use_ns: 1000, last_use_ns: 5000,
-            requests_count: 3, bytes_total: 1_000_000,
+            first_use_ns: 1000,
+            last_use_ns: 5000,
+            requests_count: 3,
+            bytes_total: 1_000_000,
         };
         assert_eq!(record.requests_count, 3);
     }
@@ -653,5 +712,30 @@ mod tests {
         let events: Vec<_> = rx.try_iter().collect();
         assert_eq!(events.len(), 2);
         assert_eq!(handler.bytes_received, PAGE_SIZE * 2);
+    }
+
+    #[test]
+    fn frontier_blocker_check_uses_real_chunk_range_start() {
+        let frontier_byte = 8 * 1024 * 1024;
+        let page_size = PAGE_SIZE;
+        let mixed_size_prefetch = PrioritizedChunk {
+            chunk_id: 1,
+            range_start: 8 * 1024 * 1024,
+            range_end: 16 * 1024 * 1024 - 1,
+            lane: Lane::Prefetch,
+            attempt: 1,
+            retry_after: None,
+        };
+        let far_prefetch = PrioritizedChunk {
+            chunk_id: 2,
+            range_start: 32 * 1024 * 1024,
+            range_end: 40 * 1024 * 1024 - 1,
+            lane: Lane::Prefetch,
+            attempt: 1,
+            retry_after: None,
+        };
+
+        assert!(mixed_size_prefetch.range_start <= frontier_byte + page_size);
+        assert!(far_prefetch.range_start > frontier_byte + page_size);
     }
 }

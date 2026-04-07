@@ -1,14 +1,17 @@
 mod config;
 
 use clap::{Parser, Subcommand};
-use frontier_provider::{DebridProvider, realdebrid::RealDebridProvider, premiumize::PremiumizeProvider};
 use frontier_core::{run_frontier_tracker, FrontierRunConfig};
-use frontier_telemetry::sqlite as db;
+use frontier_provider::{
+    premiumize::PremiumizeProvider, realdebrid::RealDebridProvider, DebridProvider,
+};
+use frontier_telemetry::events::Lane;
 use frontier_telemetry::jsonl;
+use frontier_telemetry::sqlite as db;
 use frontier_transport::download::{self, DownloadParams};
 use frontier_transport::probe;
 use frontier_transport::reactor::{self, ChunkRequest, ReactorConfig};
-use frontier_telemetry::events::Lane;
+use frontier_transport::ProtocolMode;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -46,6 +49,10 @@ enum Commands {
     Probe {
         /// URL or asset key (e.g., realdebrid:LU3DESWCEVAM4:1:169114151864)
         target: String,
+
+        /// Force transport protocol negotiation (default: config value)
+        #[arg(long)]
+        protocol: Option<ProtocolMode>,
     },
 
     /// Run a full parallel benchmark against a URL or asset key
@@ -65,9 +72,17 @@ enum Commands {
         #[arg(long)]
         chunk_size_mb: Option<u32>,
 
+        /// Prefetch chunk size in MB (default: from config, typically 8)
+        #[arg(long)]
+        prefetch_chunk_size_mb: Option<u32>,
+
         /// Number of urgent workers (default: from config)
         #[arg(long)]
         workers: Option<u32>,
+
+        /// Force transport protocol negotiation (default: config value)
+        #[arg(long)]
+        protocol: Option<ProtocolMode>,
 
         /// Capture a pcap file of all CDN traffic (requires sudo for tcpdump)
         #[arg(long)]
@@ -141,21 +156,31 @@ fn main() {
             println!();
             println!("Providers:");
             if let Some(ref rd) = cfg.providers.realdebrid {
-                println!("  realdebrid: API key {}configured", if rd.api_key.is_empty() { "NOT " } else { "" });
+                println!(
+                    "  realdebrid: API key {}configured",
+                    if rd.api_key.is_empty() { "NOT " } else { "" }
+                );
             } else {
                 println!("  realdebrid: not configured");
             }
             if let Some(ref pm) = cfg.providers.premiumize {
-                println!("  premiumize: API key {}configured", if pm.api_key.is_empty() { "NOT " } else { "" });
+                println!(
+                    "  premiumize: API key {}configured",
+                    if pm.api_key.is_empty() { "NOT " } else { "" }
+                );
             } else {
                 println!("  premiumize: not configured");
             }
             println!();
             println!("Defaults:");
             println!("  chunk_size_mb:    {}", cfg.defaults.chunk_size_mb);
+            println!(
+                "  prefetch_chunk_size_mb: {}",
+                cfg.defaults.prefetch_chunk_size_mb
+            );
             println!("  page_size_kb:     {}", cfg.defaults.page_size_kb);
             println!("  urgent_workers:   {}", cfg.defaults.urgent_workers);
-            println!("  prefetch_workers: {}", cfg.defaults.prefetch_workers);
+            println!("  prefetch_workers: {}", config::FIXED_PREFETCH_WORKERS);
             println!("  protocol:         {:?}", cfg.defaults.protocol);
             println!("  sink:             {:?}", cfg.defaults.sink);
             println!();
@@ -182,7 +207,9 @@ fn main() {
                                 let size_mb = asset.key.size_bytes as f64 / 1_048_576.0;
                                 println!(
                                     "  [{i}] {} ({:.1} MB) [{}]",
-                                    asset.filename, size_mb, asset.key.canonical()
+                                    asset.filename,
+                                    size_mb,
+                                    asset.key.canonical()
                                 );
                             }
                         }
@@ -195,10 +222,12 @@ fn main() {
             }
         },
 
-        Commands::Probe { target } => {
+        Commands::Probe { target, protocol } => {
             let url = resolve_target(&target, &cfg);
+            let effective_protocol = protocol.unwrap_or(cfg.defaults.protocol);
             println!("Probing: {url}");
-            match probe::probe_url(&url, Duration::from_secs(30)) {
+            println!("Requested protocol: {effective_protocol}");
+            match probe::probe_url(&url, Duration::from_secs(30), effective_protocol) {
                 Ok(result) => {
                     println!();
                     println!("Range support:  {}", result.range_support);
@@ -228,11 +257,26 @@ fn main() {
             }
         }
 
-        Commands::Benchmark { target, duration, max_bytes, chunk_size_mb, workers, pcap, output } => {
+        Commands::Benchmark {
+            target,
+            duration,
+            max_bytes,
+            chunk_size_mb,
+            prefetch_chunk_size_mb,
+            workers,
+            protocol,
+            pcap,
+            output,
+        } => {
             let page_size = (cfg.defaults.page_size_kb as u64) * 1024;
-            let effective_chunk_mb = chunk_size_mb.unwrap_or(cfg.defaults.chunk_size_mb);
-            let chunk_size = (effective_chunk_mb as u64) * 1024 * 1024;
+            let effective_urgent_chunk_mb = chunk_size_mb.unwrap_or(cfg.defaults.chunk_size_mb);
+            let effective_prefetch_chunk_mb =
+                prefetch_chunk_size_mb.unwrap_or(cfg.defaults.prefetch_chunk_size_mb);
+            let urgent_chunk_size = (effective_urgent_chunk_mb as u64) * 1024 * 1024;
+            let prefetch_chunk_size = (effective_prefetch_chunk_mb as u64) * 1024 * 1024;
             let effective_urgent_workers = workers.unwrap_or(cfg.defaults.urgent_workers);
+            let effective_prefetch_workers = config::FIXED_PREFETCH_WORKERS;
+            let effective_protocol = protocol.unwrap_or(cfg.defaults.protocol);
             let trace_dir = output.unwrap_or_else(|| cfg.output.trace_dir.clone());
             let run_id = format!(
                 "run_{}",
@@ -249,19 +293,24 @@ fn main() {
 
             // Probe first
             println!("Probing: {url}");
-            let probe_result = match probe::probe_url(&url, Duration::from_secs(30)) {
-                Ok(r) => {
-                    println!("  Range support: {}, Content length: {:?}, Protocol: {}",
-                        r.range_support,
-                        r.content_length.map(|l| format!("{:.1} MB", l as f64 / 1_048_576.0)),
-                        r.protocol);
-                    r
-                }
-                Err(e) => {
-                    eprintln!("Probe failed: {e}");
-                    std::process::exit(1);
-                }
-            };
+            println!("Requested protocol: {effective_protocol}");
+            let probe_result =
+                match probe::probe_url(&url, Duration::from_secs(30), effective_protocol) {
+                    Ok(r) => {
+                        println!(
+                            "  Range support: {}, Content length: {:?}, Protocol: {}",
+                            r.range_support,
+                            r.content_length
+                                .map(|l| format!("{:.1} MB", l as f64 / 1_048_576.0)),
+                            r.protocol
+                        );
+                        r
+                    }
+                    Err(e) => {
+                        eprintln!("Probe failed: {e}");
+                        std::process::exit(1);
+                    }
+                };
 
             // Start pcap capture if requested
             let mut tcpdump_child: Option<std::process::Child> = None;
@@ -271,20 +320,28 @@ fn main() {
                     let _ = std::fs::create_dir_all(parent);
                 }
                 // Extract CDN IP from probe result (format: "ip:port")
-                let cdn_ip = probe_result.remote_endpoint
+                let cdn_ip = probe_result
+                    .remote_endpoint
                     .split(':')
                     .next()
                     .unwrap_or("")
                     .to_string();
                 if !cdn_ip.is_empty() {
-                    println!("Starting pcap capture (host {cdn_ip}) -> {}", pcap_file.display());
+                    println!(
+                        "Starting pcap capture (host {cdn_ip}) -> {}",
+                        pcap_file.display()
+                    );
                     println!("  Note: requires sudo or BPF access. Run with: sudo ./frontier-sim benchmark ... --pcap");
                     match std::process::Command::new("tcpdump")
                         .args([
-                            "-i", "any",
-                            "-w", pcap_file.to_str().unwrap_or("capture.pcap"),
-                            "-s", "0",        // full packet capture
-                            "host", &cdn_ip,
+                            "-i",
+                            "any",
+                            "-w",
+                            pcap_file.to_str().unwrap_or("capture.pcap"),
+                            "-s",
+                            "0", // full packet capture
+                            "host",
+                            &cdn_ip,
                         ])
                         .stdout(std::process::Stdio::null())
                         .stderr(std::process::Stdio::piped())
@@ -294,7 +351,10 @@ fn main() {
                             tcpdump_child = Some(child);
                             // Give tcpdump a moment to start
                             std::thread::sleep(Duration::from_millis(500));
-                            println!("  pcap capture running (PID {})", tcpdump_child.as_ref().unwrap().id());
+                            println!(
+                                "  pcap capture running (PID {})",
+                                tcpdump_child.as_ref().unwrap().id()
+                            );
                         }
                         Err(e) => {
                             eprintln!("  Failed to start tcpdump: {e}");
@@ -318,38 +378,18 @@ fn main() {
             };
 
             // Build chunk list
-            let mut chunks = Vec::new();
-            let mut offset = 0u64;
-            let mut chunk_id = 0u64;
-            while offset < download_size {
-                let end = (offset + chunk_size - 1).min(download_size - 1);
-                let lane = if chunks.is_empty() || offset < chunk_size * 2 {
-                    Lane::Urgent
-                } else {
-                    Lane::Prefetch
-                };
-                chunks.push(ChunkRequest {
-                    chunk_id,
-                    range_start: offset,
-                    range_end: end,
-                    lane,
-                });
-                offset = end + 1;
-                chunk_id += 1;
-                // Cap chunk list to avoid huge memory for very large files
-                if chunks.len() >= 10_000 {
-                    break;
-                }
-            }
+            let chunks =
+                build_benchmark_chunks(download_size, urgent_chunk_size, prefetch_chunk_size);
 
             println!(
-                "Benchmarking: {} chunks queued ({} MB chunks), {:.1} MB available, {}s duration, {} urgent + {} prefetch workers",
+                "Benchmarking: {} chunks queued (urgent {} MB / prefetch {} MB), {:.1} MB available, {}s duration, {} urgent + {} prefetch workers",
                 chunks.len(),
-                effective_chunk_mb,
+                effective_urgent_chunk_mb,
+                effective_prefetch_chunk_mb,
                 download_size as f64 / 1_048_576.0,
                 duration,
                 effective_urgent_workers,
-                cfg.defaults.prefetch_workers,
+                effective_prefetch_workers,
             );
 
             // Set up channels: reactor -> frontier tracker -> JSONL writer
@@ -371,10 +411,14 @@ fn main() {
                 run_id: run_id.clone(),
                 asset_key: asset_key.clone(),
                 config: serde_json::json!({
-                    "chunk_size_mb": effective_chunk_mb,
+                    "urgent_chunk_size_mb": effective_urgent_chunk_mb,
+                    "prefetch_chunk_size_mb": effective_prefetch_chunk_mb,
+                    "urgent_chunk_size_bytes": urgent_chunk_size,
+                    "prefetch_chunk_size_bytes": prefetch_chunk_size,
                     "page_size_kb": cfg.defaults.page_size_kb,
                     "urgent_workers": effective_urgent_workers,
-                    "prefetch_workers": cfg.defaults.prefetch_workers,
+                    "prefetch_workers": effective_prefetch_workers,
+                    "protocol": effective_protocol.to_string(),
                     "sink": format!("{:?}", cfg.defaults.sink),
                 }),
                 timestamp_ns: 0,
@@ -383,9 +427,10 @@ fn main() {
             // Spawn frontier tracker thread with feedback channel to reactor
             let frontier_config = FrontierRunConfig {
                 page_size,
-                chunk_size_bytes: chunk_size,
+                urgent_chunk_size_bytes: urgent_chunk_size,
+                prefetch_chunk_size_bytes: prefetch_chunk_size,
                 urgent_workers: effective_urgent_workers,
-                prefetch_workers: cfg.defaults.prefetch_workers,
+                prefetch_workers: effective_prefetch_workers,
                 range_support: probe_result.range_support,
             };
 
@@ -393,21 +438,34 @@ fn main() {
             let (feedback_tx, feedback_rx) = crossbeam_channel::unbounded::<u64>();
 
             let frontier_handle = std::thread::spawn(move || {
-                run_frontier_tracker(reactor_rx, frontier_tx, Some(feedback_tx), run_start, frontier_config)
+                run_frontier_tracker(
+                    reactor_rx,
+                    frontier_tx,
+                    Some(feedback_tx),
+                    run_start,
+                    frontier_config,
+                )
             });
 
             // Run reactor with frontier feedback
             let reactor_config = ReactorConfig {
                 urgent_workers: effective_urgent_workers,
-                prefetch_workers: cfg.defaults.prefetch_workers,
+                prefetch_workers: effective_prefetch_workers,
                 page_size,
+                protocol: effective_protocol,
                 sink: cfg.defaults.sink,
                 max_duration: Duration::from_secs(duration),
                 ..ReactorConfig::default()
             };
 
-            let reactor_result =
-                reactor::run_parallel(&url, &chunks, &reactor_config, &reactor_tx, Some(feedback_rx), run_start);
+            let reactor_result = reactor::run_parallel(
+                &url,
+                &chunks,
+                &reactor_config,
+                &reactor_tx,
+                Some(feedback_rx),
+                run_start,
+            );
 
             // Close reactor channel to signal frontier tracker
             drop(reactor_tx);
@@ -431,6 +489,17 @@ fn main() {
                 "asset_key": asset_key,
                 "download_size": download_size,
                 "chunks": chunks.len(),
+                "benchmark_config": {
+                    "urgent_chunk_size_mb": effective_urgent_chunk_mb,
+                    "prefetch_chunk_size_mb": effective_prefetch_chunk_mb,
+                    "urgent_chunk_size_bytes": urgent_chunk_size,
+                    "prefetch_chunk_size_bytes": prefetch_chunk_size,
+                    "page_size_kb": cfg.defaults.page_size_kb,
+                    "urgent_workers": effective_urgent_workers,
+                    "prefetch_workers": effective_prefetch_workers,
+                    "protocol": effective_protocol.to_string(),
+                    "sink": format!("{:?}", cfg.defaults.sink),
+                },
                 "reactor": {
                     "total_bytes": reactor_result.as_ref().map(|r| r.total_bytes).unwrap_or(0),
                     "total_requests": reactor_result.as_ref().map(|r| r.total_requests).unwrap_or(0),
@@ -463,35 +532,50 @@ fn main() {
             println!();
             println!("=== Benchmark Results ===");
             if let Ok(ref r) = reactor_result {
-                println!("Transfer: {:.1} MB in {:.1}s ({:.1} Mbps)",
+                println!(
+                    "Transfer: {:.1} MB in {:.1}s ({:.1} Mbps)",
                     r.total_bytes as f64 / 1_048_576.0,
                     r.duration_ms / 1000.0,
                     r.total_bytes as f64 * 8.0 / r.duration_ms / 1000.0,
                 );
-                println!("Requests: {} across {} connections ({} retried, {} failed)",
-                    r.total_requests, r.total_connections, r.retried_chunks, r.failed_chunks);
+                println!(
+                    "Requests: {} across {} connections ({} retried, {} failed)",
+                    r.total_requests, r.total_connections, r.retried_chunks, r.failed_chunks
+                );
             }
-            println!("Frontier: {:.1} MB contiguous, {} events, {} stalls (max {:.1}s)",
+            println!(
+                "Frontier: {:.1} MB contiguous, {} events, {} stalls (max {:.1}s)",
                 frontier_result.final_frontier_bytes as f64 / 1_048_576.0,
                 frontier_result.frontier_events_count,
                 frontier_result.frontier_stall_count,
                 frontier_result.max_frontier_stall_ms as f64 / 1000.0,
             );
             if frontier_result.tail_drain_ms > 2_000 {
-                println!("Tail drain: {:.1}s (frontier frozen from {:.1}s to {:.1}s)",
+                println!(
+                    "Tail drain: {:.1}s (frontier frozen from {:.1}s to {:.1}s)",
                     frontier_result.tail_drain_ms as f64 / 1000.0,
-                    (frontier_result.run_duration_ms - frontier_result.tail_drain_ms) as f64 / 1000.0,
+                    (frontier_result.run_duration_ms - frontier_result.tail_drain_ms) as f64
+                        / 1000.0,
                     frontier_result.run_duration_ms as f64 / 1000.0,
                 );
             }
             if let Some(rate) = frontier_result.frontier_advance_rate_mbps {
                 println!("Frontier rate: {:.1} Mbps", rate);
             }
-            println!("Max sustainable: {:.1} Mbps", frontier_result.max_sustainable_bitrate_mbps);
-            println!("Safe budget:     {:.1} Mbps", frontier_result.safe_budget_mbps);
+            println!(
+                "Max sustainable: {:.1} Mbps",
+                frontier_result.max_sustainable_bitrate_mbps
+            );
+            println!(
+                "Safe budget:     {:.1} Mbps",
+                frontier_result.safe_budget_mbps
+            );
             println!();
             println!("Capability Envelope:");
-            println!("  {}", serde_json::to_string_pretty(&frontier_result.envelope).unwrap_or_default());
+            println!(
+                "  {}",
+                serde_json::to_string_pretty(&frontier_result.envelope).unwrap_or_default()
+            );
 
             // Store in SQLite
             let db_path = std::path::Path::new(&cfg.output.db_path);
@@ -501,13 +585,26 @@ fn main() {
                     .unwrap_or_default()
                     .as_millis() as i64;
                 let config_json = serde_json::json!({
-                    "chunk_size_mb": effective_chunk_mb,
+                    "urgent_chunk_size_mb": effective_urgent_chunk_mb,
+                    "prefetch_chunk_size_mb": effective_prefetch_chunk_mb,
+                    "urgent_chunk_size_bytes": urgent_chunk_size,
+                    "prefetch_chunk_size_bytes": prefetch_chunk_size,
                     "page_size_kb": cfg.defaults.page_size_kb,
                     "urgent_workers": effective_urgent_workers,
-                    "prefetch_workers": cfg.defaults.prefetch_workers,
-                }).to_string();
-                let _ = db::insert_run(&db_conn, &run_id, &asset_key, "", started_at_ms, &config_json);
-                let envelope_json = serde_json::to_string(&frontier_result.envelope).unwrap_or_default();
+                    "prefetch_workers": effective_prefetch_workers,
+                    "protocol": effective_protocol.to_string(),
+                })
+                .to_string();
+                let _ = db::insert_run(
+                    &db_conn,
+                    &run_id,
+                    &asset_key,
+                    "",
+                    started_at_ms,
+                    &config_json,
+                );
+                let envelope_json =
+                    serde_json::to_string(&frontier_result.envelope).unwrap_or_default();
                 let sum_json = serde_json::to_string(&summary).unwrap_or_default();
                 let _ = db::finish_run(&db_conn, &run_id, started_at_ms, &envelope_json, &sum_json);
 
@@ -515,11 +612,16 @@ fn main() {
                 if let Ok(ref r) = reactor_result {
                     for conn_rec in &r.connections {
                         let _ = db::insert_connection(
-                            &db_conn, &run_id, conn_rec.connection_id,
-                            &conn_rec.protocol, &conn_rec.local_endpoint, &conn_rec.remote_endpoint,
+                            &db_conn,
+                            &run_id,
+                            conn_rec.connection_id,
+                            &conn_rec.protocol,
+                            &conn_rec.local_endpoint,
+                            &conn_rec.remote_endpoint,
                             conn_rec.first_use_ns as f64 / 1_000_000.0,
                             conn_rec.last_use_ns as f64 / 1_000_000.0,
-                            conn_rec.requests_count, conn_rec.bytes_total,
+                            conn_rec.requests_count,
+                            conn_rec.bytes_total,
                         );
                     }
                 }
@@ -538,7 +640,11 @@ fn main() {
                 if let Some(ref pcap_file) = pcap_path {
                     if pcap_file.exists() {
                         let size = std::fs::metadata(pcap_file).map(|m| m.len()).unwrap_or(0);
-                        println!("pcap: {} ({:.1} MB)", pcap_file.display(), size as f64 / 1_048_576.0);
+                        println!(
+                            "pcap: {} ({:.1} MB)",
+                            pcap_file.display(),
+                            size as f64 / 1_048_576.0
+                        );
                         println!("  Open with: wireshark {}", pcap_file.display());
                         println!("  Filter: tcp.flags.reset == 1  (to see RST packets)");
                         println!("  Filter: ssl.handshake  (to see TLS handshakes)");
@@ -557,35 +663,43 @@ fn main() {
                 }
             };
             match action {
-                RunsAction::List => {
-                    match db::list_runs(&db_conn) {
-                        Ok(runs) => {
-                            if runs.is_empty() {
-                                println!("No benchmark runs found.");
-                            } else {
-                                println!("{:<30} {:<12} {:<40} {}", "RUN ID", "PROVIDER", "ASSET", "ENVELOPE");
-                                println!("{}", "-".repeat(100));
-                                for run in &runs {
-                                    let envelope_summary = run.envelope_json.as_deref()
-                                        .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
-                                        .map(|v| format!(
+                RunsAction::List => match db::list_runs(&db_conn) {
+                    Ok(runs) => {
+                        if runs.is_empty() {
+                            println!("No benchmark runs found.");
+                        } else {
+                            println!(
+                                "{:<30} {:<12} {:<40} {}",
+                                "RUN ID", "PROVIDER", "ASSET", "ENVELOPE"
+                            );
+                            println!("{}", "-".repeat(100));
+                            for run in &runs {
+                                let envelope_summary = run
+                                    .envelope_json
+                                    .as_deref()
+                                    .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+                                    .map(|v| {
+                                        format!(
                                             "{:.0} Mbps, {} workers",
                                             v["sustainedThroughputMbps"].as_f64().unwrap_or(0.0),
                                             v["maxSafeUrgentWorkers"].as_u64().unwrap_or(0),
-                                        ))
-                                        .unwrap_or_else(|| "pending".to_string());
-                                    let asset_short = if run.asset_key.len() > 38 {
-                                        format!("{}...", &run.asset_key[..35])
-                                    } else {
-                                        run.asset_key.clone()
-                                    };
-                                    println!("{:<30} {:<12} {:<40} {}", run.run_id, run.provider, asset_short, envelope_summary);
-                                }
+                                        )
+                                    })
+                                    .unwrap_or_else(|| "pending".to_string());
+                                let asset_short = if run.asset_key.len() > 38 {
+                                    format!("{}...", &run.asset_key[..35])
+                                } else {
+                                    run.asset_key.clone()
+                                };
+                                println!(
+                                    "{:<30} {:<12} {:<40} {}",
+                                    run.run_id, run.provider, asset_short, envelope_summary
+                                );
                             }
                         }
-                        Err(e) => eprintln!("Error listing runs: {e}"),
                     }
-                }
+                    Err(e) => eprintln!("Error listing runs: {e}"),
+                },
                 RunsAction::Show { run_id } => {
                     match db::get_run(&db_conn, &run_id) {
                         Ok(Some(run)) => {
@@ -595,18 +709,26 @@ fn main() {
                             println!();
                             if let Some(ref summary) = run.summary_json {
                                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(summary) {
-                                    println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+                                    println!(
+                                        "{}",
+                                        serde_json::to_string_pretty(&v).unwrap_or_default()
+                                    );
                                 }
                             }
                             if let Some(ref envelope) = run.envelope_json {
                                 println!();
                                 println!("Capability Envelope:");
                                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(envelope) {
-                                    println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+                                    println!(
+                                        "{}",
+                                        serde_json::to_string_pretty(&v).unwrap_or_default()
+                                    );
                                 }
                             }
                             // Request stats
-                            if let Ok((count, avg_ttfb, avg_total, sum_bytes)) = db::get_request_stats(&db_conn, &run_id) {
+                            if let Ok((count, avg_ttfb, avg_total, sum_bytes)) =
+                                db::get_request_stats(&db_conn, &run_id)
+                            {
                                 println!();
                                 println!("Request Stats:");
                                 println!("  Total requests:  {count}");
@@ -672,7 +794,11 @@ fn main() {
                 Ok(result) => {
                     println!();
                     println!("Download complete:");
-                    println!("  Bytes:      {} ({:.1} MB)", result.total_bytes, result.total_bytes as f64 / 1_048_576.0);
+                    println!(
+                        "  Bytes:      {} ({:.1} MB)",
+                        result.total_bytes,
+                        result.total_bytes as f64 / 1_048_576.0
+                    );
                     println!("  DNS:        {:.1} ms", result.dns_ms);
                     println!("  Connect:    {:.1} ms", result.connect_ms);
                     println!("  TLS:        {:.1} ms", result.tls_ms);
@@ -727,7 +853,10 @@ fn resolve_target(target: &str, cfg: &config::Config) -> String {
     let provider_name = parts[0];
     let providers = build_providers(cfg, Some(provider_name));
     if providers.is_empty() {
-        eprintln!("Provider '{}' not configured. Check frontier.toml or environment variables.", provider_name);
+        eprintln!(
+            "Provider '{}' not configured. Check frontier.toml or environment variables.",
+            provider_name
+        );
         std::process::exit(1);
     }
     let provider = &providers[0];
@@ -740,7 +869,10 @@ fn resolve_target(target: &str, cfg: &config::Config) -> String {
             std::process::exit(1);
         }
     };
-    let asset = candidates.iter().find(|a| a.key.canonical() == target).cloned();
+    let asset = candidates
+        .iter()
+        .find(|a| a.key.canonical() == target)
+        .cloned();
     let asset = match asset {
         Some(a) => a,
         None => {
@@ -753,7 +885,11 @@ fn resolve_target(target: &str, cfg: &config::Config) -> String {
         }
     };
 
-    println!("Resolving direct URL for: {} ({:.1} MB)", asset.filename, asset.key.size_bytes as f64 / 1_048_576.0);
+    println!(
+        "Resolving direct URL for: {} ({:.1} MB)",
+        asset.filename,
+        asset.key.size_bytes as f64 / 1_048_576.0
+    );
     let resolved = match provider.resolve_direct_url(&asset) {
         Ok(r) => r,
         Err(e) => {
@@ -765,10 +901,7 @@ fn resolve_target(target: &str, cfg: &config::Config) -> String {
     resolved.direct_url
 }
 
-fn build_providers(
-    cfg: &config::Config,
-    filter: Option<&str>,
-) -> Vec<Box<dyn DebridProvider>> {
+fn build_providers(cfg: &config::Config, filter: Option<&str>) -> Vec<Box<dyn DebridProvider>> {
     let mut providers: Vec<Box<dyn DebridProvider>> = Vec::new();
 
     let want_rd = filter.is_none() || filter == Some("realdebrid");
@@ -790,4 +923,103 @@ fn build_providers(
     }
 
     providers
+}
+
+fn build_benchmark_chunks(
+    download_size: u64,
+    urgent_chunk_size: u64,
+    prefetch_chunk_size: u64,
+) -> Vec<ChunkRequest> {
+    let mut chunks = Vec::new();
+    let mut offset = 0u64;
+    let mut chunk_id = 0u64;
+    let urgent_boundary = urgent_chunk_size.saturating_mul(2);
+
+    while offset < download_size {
+        let (chunk_size, lane) = if offset < urgent_boundary {
+            (urgent_chunk_size, Lane::Urgent)
+        } else {
+            (prefetch_chunk_size, Lane::Prefetch)
+        };
+        let end = (offset + chunk_size - 1).min(download_size - 1);
+        chunks.push(ChunkRequest {
+            chunk_id,
+            range_start: offset,
+            range_end: end,
+            lane,
+        });
+        offset = end + 1;
+        chunk_id += 1;
+        if chunks.len() >= 10_000 {
+            break;
+        }
+    }
+
+    chunks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn benchmark_chunks_preserve_two_urgent_then_prefetch_boundary() {
+        let mb = 1024 * 1024;
+        let chunks = build_benchmark_chunks(14 * mb, 4 * mb, 2 * mb);
+
+        assert_eq!(chunks.len(), 5);
+        assert!(chunks
+            .iter()
+            .take(2)
+            .all(|chunk| chunk.lane == Lane::Urgent));
+        assert!(chunks
+            .iter()
+            .skip(2)
+            .all(|chunk| chunk.lane == Lane::Prefetch));
+        assert_eq!(chunks[0].range_start, 0);
+        assert_eq!(chunks[0].range_end, 4 * mb - 1);
+        assert_eq!(chunks[1].range_start, 4 * mb);
+        assert_eq!(chunks[1].range_end, 8 * mb - 1);
+        assert_eq!(chunks[2].range_start, 8 * mb);
+        assert_eq!(chunks[2].range_end, 10 * mb - 1);
+        assert_eq!(chunks.last().unwrap().range_end, 14 * mb - 1);
+    }
+
+    #[test]
+    fn benchmark_protocol_override_parses() {
+        let cli = Cli::try_parse_from([
+            "frontier-sim",
+            "benchmark",
+            "https://example.com/video.mkv",
+            "--protocol",
+            "h2",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Benchmark { protocol, .. } => {
+                assert_eq!(protocol, Some(ProtocolMode::H2));
+            }
+            _ => panic!("expected benchmark command"),
+        }
+    }
+
+    #[test]
+    fn probe_protocol_override_parses() {
+        let cli = Cli::try_parse_from([
+            "frontier-sim",
+            "probe",
+            "https://example.com/video.mkv",
+            "--protocol",
+            "h1",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Probe { protocol, .. } => {
+                assert_eq!(protocol, Some(ProtocolMode::H1));
+            }
+            _ => panic!("expected probe command"),
+        }
+    }
 }

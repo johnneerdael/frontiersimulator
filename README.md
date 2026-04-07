@@ -51,10 +51,11 @@ api_key = "YOUR_REALDEBRID_API_KEY"
 api_key = "YOUR_PREMIUMIZE_API_KEY"
 
 [defaults]
-chunk_size_mb = 4        # Logical chunk size for range requests
+chunk_size_mb = 4        # Urgent lane chunk size for range requests
+prefetch_chunk_size_mb = 8 # Prefetch lane chunk size for range requests
 page_size_kb = 128       # Page size for frontier tracking (matches Kotlin)
 urgent_workers = 2       # Concurrent urgent lane workers
-prefetch_workers = 1     # Concurrent prefetch lane workers
+prefetch_workers = 1     # Fixed by the simulator/runtime
 protocol = "auto"        # auto | h1 | h2
 sink = "discard"         # discard | sparse-file | rolling-ring
 
@@ -75,6 +76,7 @@ export PREMIUMIZE_API_KEY="your_key_here"
 ### CLI flags
 
 CLI flags override both config file and environment variables. Use `--config` to specify a different config file path.
+`--chunk-size-mb` controls the urgent lane, and `--prefetch-chunk-size-mb` controls the prefetch lane.
 
 ## Usage
 
@@ -241,6 +243,8 @@ The benchmark produces a capability envelope compatible with the Kotlin `Capabil
   "measuredAtMs": 1712345678000
 }
 ```
+
+The benchmark also records both chunk sizes explicitly in `trace.jsonl`, `summary.json` (`benchmark_config`), and SQLite `config_json`.
 
 Optional fields (`p10ThroughputMbps`, `seekTtfbP50Ms`) are omitted when not available, matching Kotlin's serialization behavior.
 

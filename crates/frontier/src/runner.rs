@@ -105,7 +105,8 @@ pub fn run_frontier_tracker(
     let sim_result = estimator.find_max_sustainable_bitrate(&sim_events);
 
     // Compute tail drain: gap between last frontier advance and run end
-    let tail_drain_ms = tracker.frontier_events()
+    let tail_drain_ms = tracker
+        .frontier_events()
         .last()
         .map(|last| wall_elapsed_ms.saturating_sub(last.t_ms))
         .unwrap_or(wall_elapsed_ms);
@@ -122,17 +123,12 @@ pub fn run_frontier_tracker(
     let envelope = CapabilityEnvelope {
         max_safe_urgent_workers: config.urgent_workers,
         max_safe_prefetch_workers: config.prefetch_workers,
-        max_safe_urgent_chunk_bytes: config.chunk_size_bytes,
-        max_safe_prefetch_chunk_bytes: config.chunk_size_bytes * 2,
-        sustained_throughput_mbps: metrics
-            .frontier_advance_rate_mbps
-            .unwrap_or(0.0),
+        max_safe_urgent_chunk_bytes: config.urgent_chunk_size_bytes,
+        max_safe_prefetch_chunk_bytes: config.prefetch_chunk_size_bytes,
+        sustained_throughput_mbps: metrics.frontier_advance_rate_mbps.unwrap_or(0.0),
         p10_throughput_mbps: None, // requires multiple runs
-        seek_ttfb_p50_ms: None, // requires seek testing
-        stability_penalty: compute_stability_penalty(
-            effective_stall_count,
-            effective_max_stall,
-        ),
+        seek_ttfb_p50_ms: None,    // requires seek testing
+        stability_penalty: compute_stability_penalty(effective_stall_count, effective_max_stall),
         supports_range_requests: config.range_support,
         measured_at_ms: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -157,7 +153,8 @@ pub fn run_frontier_tracker(
 /// Configuration for the frontier runner.
 pub struct FrontierRunConfig {
     pub page_size: u64,
-    pub chunk_size_bytes: u64,
+    pub urgent_chunk_size_bytes: u64,
+    pub prefetch_chunk_size_bytes: u64,
     pub urgent_workers: u32,
     pub prefetch_workers: u32,
     pub range_support: bool,
@@ -188,7 +185,8 @@ mod tests {
 
         let config = FrontierRunConfig {
             page_size: 128 * 1024,
-            chunk_size_bytes: 4 * 1024 * 1024,
+            urgent_chunk_size_bytes: 4 * 1024 * 1024,
+            prefetch_chunk_size_bytes: 8 * 1024 * 1024,
             urgent_workers: 2,
             prefetch_workers: 1,
             range_support: true,
@@ -217,6 +215,11 @@ mod tests {
         assert!(result.frontier_events_count > 0);
         assert!(result.envelope.sustained_throughput_mbps > 0.0);
         assert!(result.envelope.supports_range_requests);
+        assert_eq!(result.envelope.max_safe_urgent_chunk_bytes, 4 * 1024 * 1024);
+        assert_eq!(
+            result.envelope.max_safe_prefetch_chunk_bytes,
+            8 * 1024 * 1024
+        );
 
         // Check that frontier_advanced events were emitted
         let events: Vec<_> = frontier_rx.try_iter().collect();

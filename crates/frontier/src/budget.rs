@@ -99,7 +99,8 @@ impl SafeBudgetEstimator {
                 }
             }
 
-            buffer_bytes = (buffer_bytes + event.delta_contiguous_bytes as f64).min(max_buffer_bytes);
+            buffer_bytes =
+                (buffer_bytes + event.delta_contiguous_bytes as f64).min(max_buffer_bytes);
 
             if !started && buffer_bytes >= startup_buffer_bytes {
                 started = true;

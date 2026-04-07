@@ -1,5 +1,5 @@
 use crate::curl_ffi;
-use crate::ProbeResult;
+use crate::{negotiated_http_version, ProbeResult, ProtocolMode};
 use curl::easy::{Easy2, Handler, WriteError};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
@@ -36,7 +36,11 @@ impl Handler for ProbeHandler {
 }
 
 /// Probe a URL to determine range support, content length, protocol, and timing facts.
-pub fn probe_url(url: &str, timeout: Duration) -> Result<ProbeResult, String> {
+pub fn probe_url(
+    url: &str,
+    timeout: Duration,
+    protocol: ProtocolMode,
+) -> Result<ProbeResult, String> {
     curl_ffi::check_minimum_version().map_err(|e| e)?;
 
     let mut easy = Easy2::new(ProbeHandler::new());
@@ -45,11 +49,12 @@ pub fn probe_url(url: &str, timeout: Duration) -> Result<ProbeResult, String> {
         .map_err(|e| format!("follow location: {e}"))?;
     easy.max_redirections(10)
         .map_err(|e| format!("max redirects: {e}"))?;
-    easy.timeout(timeout)
-        .map_err(|e| format!("timeout: {e}"))?;
+    easy.timeout(timeout).map_err(|e| format!("timeout: {e}"))?;
+    protocol
+        .apply_to(&mut easy)
+        .map_err(|e| format!("protocol: {e}"))?;
     // Use HEAD if possible; fall back to GET with nobody
-    easy.nobody(true)
-        .map_err(|e| format!("nobody: {e}"))?;
+    easy.nobody(true).map_err(|e| format!("nobody: {e}"))?;
     // Record timing
     easy.perform().map_err(|e| format!("perform: {e}"))?;
 
@@ -94,20 +99,7 @@ pub fn probe_url(url: &str, timeout: Duration) -> Result<ProbeResult, String> {
         .unwrap_or(0.0);
 
     // Protocol
-    let http_version = easy
-        .response_code()
-        .map(|_| {
-            // Infer from headers — check for HTTP/2 indicator
-            if headers
-                .iter()
-                .any(|(_, v)| v.contains("h2") || v.contains("HTTP/2"))
-            {
-                "h2".to_string()
-            } else {
-                "h1.1".to_string()
-            }
-        })
-        .unwrap_or_else(|_| "unknown".to_string());
+    let http_version = negotiated_http_version(easy.raw());
 
     // Connection endpoints via curl_ffi
     let raw = easy.raw();

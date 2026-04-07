@@ -1,5 +1,5 @@
-pub mod realdebrid;
 pub mod premiumize;
+pub mod realdebrid;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -16,7 +16,10 @@ pub struct AssetKey {
 impl AssetKey {
     pub fn canonical(&self) -> String {
         match self.file_index {
-            Some(idx) => format!("{}:{}:{}:{}", self.provider, self.item_id, idx, self.size_bytes),
+            Some(idx) => format!(
+                "{}:{}:{}:{}",
+                self.provider, self.item_id, idx, self.size_bytes
+            ),
             None => format!("{}:{}:{}", self.provider, self.item_id, self.size_bytes),
         }
     }

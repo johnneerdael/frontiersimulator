@@ -10,9 +10,9 @@ api_key = "YOUR_PREMIUMIZE_API_KEY"
 
 [defaults]
 chunk_size_mb = 4
+prefetch_chunk_size_mb = 8
 page_size_kb = 128
 urgent_workers = 2
-prefetch_workers = 1
 protocol = "auto"    # auto | h1 | h2
 sink = "discard"     # discard | sparse-file | rolling-ring
 

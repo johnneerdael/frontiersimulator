@@ -29,12 +29,12 @@ pub struct ProviderEntry {
 pub struct DefaultsConfig {
     #[serde(default = "default_chunk_size_mb")]
     pub chunk_size_mb: u32,
+    #[serde(default = "default_prefetch_chunk_size_mb")]
+    pub prefetch_chunk_size_mb: u32,
     #[serde(default = "default_page_size_kb")]
     pub page_size_kb: u32,
     #[serde(default = "default_urgent_workers")]
     pub urgent_workers: u32,
-    #[serde(default = "default_prefetch_workers")]
-    pub prefetch_workers: u32,
     #[serde(default)]
     pub protocol: ProtocolMode,
     #[serde(default)]
@@ -49,20 +49,34 @@ pub struct OutputConfig {
     pub db_path: String,
 }
 
-fn default_chunk_size_mb() -> u32 { 4 }
-fn default_page_size_kb() -> u32 { 128 }
-fn default_urgent_workers() -> u32 { 2 }
-fn default_prefetch_workers() -> u32 { 1 }
-fn default_trace_dir() -> String { "./traces".to_string() }
-fn default_db_path() -> String { "./frontier.db".to_string() }
+pub const FIXED_PREFETCH_WORKERS: u32 = 1;
+
+fn default_chunk_size_mb() -> u32 {
+    4
+}
+fn default_prefetch_chunk_size_mb() -> u32 {
+    8
+}
+fn default_page_size_kb() -> u32 {
+    128
+}
+fn default_urgent_workers() -> u32 {
+    2
+}
+fn default_trace_dir() -> String {
+    "./traces".to_string()
+}
+fn default_db_path() -> String {
+    "./frontier.db".to_string()
+}
 
 impl Default for DefaultsConfig {
     fn default() -> Self {
         Self {
             chunk_size_mb: default_chunk_size_mb(),
+            prefetch_chunk_size_mb: default_prefetch_chunk_size_mb(),
             page_size_kb: default_page_size_kb(),
             urgent_workers: default_urgent_workers(),
-            prefetch_workers: default_prefetch_workers(),
             protocol: ProtocolMode::default(),
             sink: Sink::default(),
         }
@@ -86,10 +100,9 @@ impl Config {
     /// - PREMIUMIZE_API_KEY overrides providers.premiumize.api_key
     pub fn load(path: &str) -> Result<Self, ConfigError> {
         let mut config = if Path::new(path).exists() {
-            let contents = std::fs::read_to_string(path)
-                .map_err(|e| ConfigError::Io(e.to_string()))?;
-            toml::from_str::<Config>(&contents)
-                .map_err(|e| ConfigError::Parse(e.to_string()))?
+            let contents =
+                std::fs::read_to_string(path).map_err(|e| ConfigError::Io(e.to_string()))?;
+            toml::from_str::<Config>(&contents).map_err(|e| ConfigError::Parse(e.to_string()))?
         } else {
             // No config file — use defaults
             Config {
@@ -127,9 +140,9 @@ mod tests {
     fn defaults_without_config_file() {
         let config = Config::load("/nonexistent/path.toml").unwrap();
         assert_eq!(config.defaults.chunk_size_mb, 4);
+        assert_eq!(config.defaults.prefetch_chunk_size_mb, 8);
         assert_eq!(config.defaults.page_size_kb, 128);
         assert_eq!(config.defaults.urgent_workers, 2);
-        assert_eq!(config.defaults.prefetch_workers, 1);
         assert_eq!(config.defaults.protocol, ProtocolMode::Auto);
         assert_eq!(config.defaults.sink, Sink::Discard);
     }
@@ -154,6 +167,7 @@ api_key = "pm_key"
 
 [defaults]
 chunk_size_mb = 8
+prefetch_chunk_size_mb = 16
 page_size_kb = 128
 urgent_workers = 3
 prefetch_workers = 2
@@ -166,6 +180,7 @@ db_path = "/tmp/frontier.db"
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.defaults.chunk_size_mb, 8);
+        assert_eq!(config.defaults.prefetch_chunk_size_mb, 16);
         assert_eq!(config.defaults.urgent_workers, 3);
         assert_eq!(config.defaults.protocol, ProtocolMode::H2);
         assert_eq!(config.output.trace_dir, "/tmp/traces");
@@ -173,5 +188,20 @@ db_path = "/tmp/frontier.db"
             config.providers.realdebrid.as_ref().unwrap().api_key,
             "rd_key"
         );
+    }
+
+    #[test]
+    fn legacy_prefetch_workers_input_does_not_change_fixed_runtime_value() {
+        let toml_str = r#"
+[defaults]
+chunk_size_mb = 4
+prefetch_chunk_size_mb = 8
+urgent_workers = 2
+prefetch_workers = 4
+"#;
+
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.defaults.prefetch_chunk_size_mb, 8);
+        assert_eq!(FIXED_PREFETCH_WORKERS, 1);
     }
 }

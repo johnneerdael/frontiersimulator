@@ -76,8 +76,7 @@ impl DebridProvider for RealDebridProvider {
 
     fn list_candidates(&self) -> Result<Vec<AssetRef>, ProviderError> {
         // List torrents and find video files
-        let torrents: Vec<RdTorrent> =
-            self.get_json("/rest/1.0/torrents?limit=200")?;
+        let torrents: Vec<RdTorrent> = self.get_json("/rest/1.0/torrents?limit=200")?;
 
         let mut candidates = Vec::new();
 
@@ -92,21 +91,20 @@ impl DebridProvider for RealDebridProvider {
             let selected_files: Vec<&RdTorrentFile> =
                 info.files.iter().filter(|f| f.selected == 1).collect();
 
-            let file_link_pairs: Vec<(&RdTorrentFile, &str)> = if !selected_files.is_empty()
-                && selected_files.len() == info.links.len()
-            {
-                selected_files
-                    .iter()
-                    .zip(info.links.iter())
-                    .map(|(f, l)| (*f, l.as_str()))
-                    .collect()
-            } else {
-                info.files
-                    .iter()
-                    .zip(info.links.iter())
-                    .map(|(f, l)| (f, l.as_str()))
-                    .collect()
-            };
+            let file_link_pairs: Vec<(&RdTorrentFile, &str)> =
+                if !selected_files.is_empty() && selected_files.len() == info.links.len() {
+                    selected_files
+                        .iter()
+                        .zip(info.links.iter())
+                        .map(|(f, l)| (*f, l.as_str()))
+                        .collect()
+                } else {
+                    info.files
+                        .iter()
+                        .zip(info.links.iter())
+                        .map(|(f, l)| (f, l.as_str()))
+                        .collect()
+                };
 
             for (file, _link) in file_link_pairs {
                 let size = file.bytes.unwrap_or(0) as u64;
@@ -151,21 +149,20 @@ impl DebridProvider for RealDebridProvider {
         let selected_files: Vec<&RdTorrentFile> =
             info.files.iter().filter(|f| f.selected == 1).collect();
 
-        let file_link_pairs: Vec<(&RdTorrentFile, &str)> = if !selected_files.is_empty()
-            && selected_files.len() == info.links.len()
-        {
-            selected_files
-                .iter()
-                .zip(info.links.iter())
-                .map(|(f, l)| (*f, l.as_str()))
-                .collect()
-        } else {
-            info.files
-                .iter()
-                .zip(info.links.iter())
-                .map(|(f, l)| (f, l.as_str()))
-                .collect()
-        };
+        let file_link_pairs: Vec<(&RdTorrentFile, &str)> =
+            if !selected_files.is_empty() && selected_files.len() == info.links.len() {
+                selected_files
+                    .iter()
+                    .zip(info.links.iter())
+                    .map(|(f, l)| (*f, l.as_str()))
+                    .collect()
+            } else {
+                info.files
+                    .iter()
+                    .zip(info.links.iter())
+                    .map(|(f, l)| (f, l.as_str()))
+                    .collect()
+            };
 
         let file_index = asset.key.file_index.unwrap_or(0);
         let (_file, link) = file_link_pairs
@@ -182,9 +179,9 @@ impl DebridProvider for RealDebridProvider {
         let unrestricted: RdUnrestricted =
             self.post_form_json("/rest/1.0/unrestrict/link", &[("link", link)])?;
 
-        let direct_url = unrestricted
-            .download
-            .ok_or_else(|| ProviderError::Other("Unrestrict response missing download URL".into()))?;
+        let direct_url = unrestricted.download.ok_or_else(|| {
+            ProviderError::Other("Unrestrict response missing download URL".into())
+        })?;
 
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -194,7 +191,9 @@ impl DebridProvider for RealDebridProvider {
         Ok(ResolvedAsset {
             key: asset.key.clone(),
             direct_url,
-            filename: unrestricted.filename.unwrap_or_else(|| asset.filename.clone()),
+            filename: unrestricted
+                .filename
+                .unwrap_or_else(|| asset.filename.clone()),
             size_bytes: unrestricted.filesize.unwrap_or(asset.key.size_bytes),
             resolved_at_ms: now_ms,
             expiry_hint: None,

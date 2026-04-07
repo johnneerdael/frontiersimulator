@@ -108,15 +108,12 @@ impl DebridProvider for PremiumizeProvider {
             self.get_json("/item/details", &[("id", &asset.key.item_id)])?;
 
         // Prefer stream_link over link (matches Python resolver)
-        let direct_url = details
-            .stream_link
-            .or(details.link)
-            .ok_or_else(|| {
-                ProviderError::NotFound(format!(
-                    "Premiumize item {} has no downloadable URL",
-                    asset.key.item_id
-                ))
-            })?;
+        let direct_url = details.stream_link.or(details.link).ok_or_else(|| {
+            ProviderError::NotFound(format!(
+                "Premiumize item {} has no downloadable URL",
+                asset.key.item_id
+            ))
+        })?;
 
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -127,7 +124,10 @@ impl DebridProvider for PremiumizeProvider {
             key: asset.key.clone(),
             direct_url,
             filename: details.name.unwrap_or_else(|| asset.filename.clone()),
-            size_bytes: details.size.map(|s| s as u64).unwrap_or(asset.key.size_bytes),
+            size_bytes: details
+                .size
+                .map(|s| s as u64)
+                .unwrap_or(asset.key.size_bytes),
             resolved_at_ms: now_ms,
             expiry_hint: None,
             provider_meta: None,

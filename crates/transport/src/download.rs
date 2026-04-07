@@ -173,8 +173,7 @@ pub fn download_range(
     );
 
     let mut easy = Easy2::new(handler);
-    easy.url(&params.url)
-        .map_err(|e| format!("set URL: {e}"))?;
+    easy.url(&params.url).map_err(|e| format!("set URL: {e}"))?;
     easy.follow_location(true)
         .map_err(|e| format!("follow location: {e}"))?;
     easy.timeout(params.timeout)
@@ -182,8 +181,7 @@ pub fn download_range(
 
     // Set byte range
     let range = format!("{}-{}", params.range_start, params.range_end);
-    easy.range(&range)
-        .map_err(|e| format!("set range: {e}"))?;
+    easy.range(&range).map_err(|e| format!("set range: {e}"))?;
 
     // Emit request_started
     let _ = event_tx.send(TraceEvent::RequestStarted {

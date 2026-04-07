@@ -264,10 +264,7 @@ pub fn get_run(conn: &Connection, run_id: &str) -> SqlResult<Option<RunRecord>> 
 }
 
 /// Get request stats for a run.
-pub fn get_request_stats(
-    conn: &Connection,
-    run_id: &str,
-) -> SqlResult<(u32, f64, f64, f64)> {
+pub fn get_request_stats(conn: &Connection, run_id: &str) -> SqlResult<(u32, f64, f64, f64)> {
     let mut stmt = conn.prepare(
         "SELECT COUNT(*), \
          COALESCE(AVG(ttfb_ms), 0), \
@@ -340,18 +337,33 @@ mod tests {
         let conn = test_db();
         insert_run(&conn, "run_1", "key", "rd", 1000, "{}").unwrap();
         insert_request(
-            &conn, "run_1", 1, 0, "urgent", 1, "0-1023", 1024, 5.0, 10.0, 8.0, 20.0, 1.0,
-            50.0, 42, true, "h1.1", None,
+            &conn, "run_1", 1, 0, "urgent", 1, "0-1023", 1024, 5.0, 10.0, 8.0, 20.0, 1.0, 50.0, 42,
+            true, "h1.1", None,
         )
         .unwrap();
         insert_request(
-            &conn, "run_1", 2, 1, "prefetch", 1, "1024-2047", 1024, 0.0, 0.0, 0.0, 15.0, 0.5,
-            30.0, 42, false, "h1.1", None,
+            &conn,
+            "run_1",
+            2,
+            1,
+            "prefetch",
+            1,
+            "1024-2047",
+            1024,
+            0.0,
+            0.0,
+            0.0,
+            15.0,
+            0.5,
+            30.0,
+            42,
+            false,
+            "h1.1",
+            None,
         )
         .unwrap();
 
-        let (count, avg_ttfb, avg_total, sum_bytes) =
-            get_request_stats(&conn, "run_1").unwrap();
+        let (count, avg_ttfb, avg_total, sum_bytes) = get_request_stats(&conn, "run_1").unwrap();
         assert_eq!(count, 2);
         assert!((avg_ttfb - 17.5).abs() < 0.01);
         assert!((avg_total - 40.0).abs() < 0.01);
@@ -363,12 +375,28 @@ mod tests {
         let conn = test_db();
         insert_run(&conn, "run_1", "key", "rd", 1000, "{}").unwrap();
 
-        insert_connection(&conn, "run_1", 1, "https", "127.0.0.1:5000", "93.184.216.34:443", 0.0, 100.0, 3, 50000).unwrap();
+        insert_connection(
+            &conn,
+            "run_1",
+            1,
+            "https",
+            "127.0.0.1:5000",
+            "93.184.216.34:443",
+            0.0,
+            100.0,
+            3,
+            50000,
+        )
+        .unwrap();
         insert_frontier_snapshot(&conn, "run_1", 100, 131072, 131072).unwrap();
         insert_frontier_snapshot(&conn, "run_1", 200, 262144, 262144).unwrap();
 
         let count: i32 = conn
-            .query_row("SELECT COUNT(*) FROM frontier_snapshots WHERE run_id = 'run_1'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM frontier_snapshots WHERE run_id = 'run_1'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(count, 2);
     }

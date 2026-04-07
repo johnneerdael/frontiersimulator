@@ -70,12 +70,7 @@ impl FrontierTracker {
     }
 
     /// Mark pages completed from raw byte range (matching Kotlin's onBytesDownloaded interface).
-    pub fn on_bytes_downloaded(
-        &mut self,
-        absolute_offset: u64,
-        bytes_read: u64,
-        t_ms: u64,
-    ) {
+    pub fn on_bytes_downloaded(&mut self, absolute_offset: u64, bytes_read: u64, t_ms: u64) {
         if bytes_read == 0 {
             return;
         }
